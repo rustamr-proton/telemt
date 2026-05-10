@@ -471,13 +471,16 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
                             this.quota_exceeded.store(true, Ordering::Release);
                             return Poll::Ready(Err(quota_io_error()));
                         }
-                        Err(crate::stats::QuotaReserveError::Contended) => {}
+                        Err(crate::stats::QuotaReserveError::Contended) => {
+                            this.stats.increment_quota_contention_total();
+                        }
                     }
                 }
 
                 if reserved_read_bytes == 0 {
                     reserve_rounds = reserve_rounds.saturating_add(1);
                     if reserve_rounds >= QUOTA_RESERVE_MAX_ROUNDS {
+                        this.stats.increment_quota_contention_timeout_total();
                         if this.arm_quota_wait(cx).is_pending() {
                             return Poll::Pending;
                         }
@@ -514,10 +517,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
         match read_result {
             Poll::Ready(Ok(n)) => {
                 if reserved_read_bytes > n as u64 {
+                    let refund_bytes = reserved_read_bytes - n as u64;
                     refund_reserved_quota_bytes(
                         this.user_stats.as_ref(),
-                        reserved_read_bytes - n as u64,
+                        refund_bytes,
                     );
+                    this.stats.add_quota_refund_bytes_total(refund_bytes);
                 }
                 if n > 0 {
                     let n_to_charge = n as u64;
@@ -565,12 +570,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
             Poll::Pending => {
                 if reserved_read_bytes > 0 {
                     refund_reserved_quota_bytes(this.user_stats.as_ref(), reserved_read_bytes);
+                    this.stats.add_quota_refund_bytes_total(reserved_read_bytes);
                 }
                 Poll::Pending
             }
             Poll::Ready(Err(err)) => {
                 if reserved_read_bytes > 0 {
                     refund_reserved_quota_bytes(this.user_stats.as_ref(), reserved_read_bytes);
+                    this.stats.add_quota_refund_bytes_total(reserved_read_bytes);
                 }
                 Poll::Ready(Err(err))
             }
@@ -655,6 +662,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                                 break;
                             }
                             Err(crate::stats::QuotaReserveError::Contended) => {
+                                this.stats.increment_quota_contention_total();
                                 saw_contention = true;
                             }
                         }
@@ -663,6 +671,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                     if reserved_bytes == 0 {
                         reserve_rounds = reserve_rounds.saturating_add(1);
                         if reserve_rounds >= QUOTA_RESERVE_MAX_ROUNDS {
+                            this.stats.increment_quota_contention_timeout_total();
                             if let Some(lease) = this.traffic_lease.as_ref() {
                                 lease.refund(RateDirection::Down, shaper_reserved_bytes);
                             }
@@ -690,10 +699,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
         match Pin::new(&mut this.inner).poll_write(cx, write_buf) {
             Poll::Ready(Ok(n)) => {
                 if reserved_bytes > n as u64 {
+                    let refund_bytes = reserved_bytes - n as u64;
                     refund_reserved_quota_bytes(
                         this.user_stats.as_ref(),
-                        reserved_bytes - n as u64,
+                        refund_bytes,
                     );
+                    this.stats.add_quota_refund_bytes_total(refund_bytes);
                 }
                 if shaper_reserved_bytes > n as u64
                     && let Some(lease) = this.traffic_lease.as_ref()
@@ -744,6 +755,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
             Poll::Ready(Err(err)) => {
                 if reserved_bytes > 0 {
                     refund_reserved_quota_bytes(this.user_stats.as_ref(), reserved_bytes);
+                    this.stats.add_quota_refund_bytes_total(reserved_bytes);
                 }
                 if shaper_reserved_bytes > 0
                     && let Some(lease) = this.traffic_lease.as_ref()
@@ -755,6 +767,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
             Poll::Pending => {
                 if reserved_bytes > 0 {
                     refund_reserved_quota_bytes(this.user_stats.as_ref(), reserved_bytes);
+                    this.stats.add_quota_refund_bytes_total(reserved_bytes);
                 }
                 if shaper_reserved_bytes > 0
                     && let Some(lease) = this.traffic_lease.as_ref()

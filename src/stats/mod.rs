@@ -274,8 +274,13 @@ pub struct Stats {
     me_inline_recovery_total: AtomicU64,
     ip_reservation_rollback_tcp_limit_total: AtomicU64,
     ip_reservation_rollback_quota_limit_total: AtomicU64,
+    quota_refund_bytes_total: AtomicU64,
+    quota_contention_total: AtomicU64,
+    quota_contention_timeout_total: AtomicU64,
     quota_write_fail_bytes_total: AtomicU64,
     quota_write_fail_events_total: AtomicU64,
+    me_child_join_timeout_total: AtomicU64,
+    me_child_abort_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
@@ -1437,6 +1442,23 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn add_quota_refund_bytes_total(&self, bytes: u64) {
+        if self.telemetry_core_enabled() {
+            self.quota_refund_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_contention_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_contention_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_contention_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_contention_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn add_quota_write_fail_bytes_total(&self, bytes: u64) {
         if self.telemetry_core_enabled() {
             self.quota_write_fail_bytes_total
@@ -1447,6 +1469,17 @@ impl Stats {
         if self.telemetry_core_enabled() {
             self.quota_write_fail_events_total
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_child_join_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.me_child_join_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_child_abort_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.me_child_abort_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_endpoint_quarantine_total(&self) {
@@ -2283,11 +2316,27 @@ impl Stats {
         self.ip_reservation_rollback_quota_limit_total
             .load(Ordering::Relaxed)
     }
+    pub fn get_quota_refund_bytes_total(&self) -> u64 {
+        self.quota_refund_bytes_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_contention_total(&self) -> u64 {
+        self.quota_contention_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_contention_timeout_total(&self) -> u64 {
+        self.quota_contention_timeout_total
+            .load(Ordering::Relaxed)
+    }
     pub fn get_quota_write_fail_bytes_total(&self) -> u64 {
         self.quota_write_fail_bytes_total.load(Ordering::Relaxed)
     }
     pub fn get_quota_write_fail_events_total(&self) -> u64 {
         self.quota_write_fail_events_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_child_join_timeout_total(&self) -> u64 {
+        self.me_child_join_timeout_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_child_abort_total(&self) -> u64 {
+        self.me_child_abort_total.load(Ordering::Relaxed)
     }
 
     pub fn increment_user_connects(&self, user: &str) {

@@ -624,6 +624,7 @@ async fn reserve_user_quota_with_yield(
     user_stats: &UserStats,
     bytes: u64,
     limit: u64,
+    stats: &Stats,
 ) -> std::result::Result<u64, QuotaReserveError> {
     let mut backoff_ms = QUOTA_RESERVE_BACKOFF_MIN_MS;
     let mut backoff_rounds = 0usize;
@@ -634,7 +635,10 @@ async fn reserve_user_quota_with_yield(
                 Err(QuotaReserveError::LimitExceeded) => {
                     return Err(QuotaReserveError::LimitExceeded);
                 }
-                Err(QuotaReserveError::Contended) => std::hint::spin_loop(),
+                Err(QuotaReserveError::Contended) => {
+                    stats.increment_quota_contention_total();
+                    std::hint::spin_loop();
+                }
             }
         }
 
@@ -642,6 +646,7 @@ async fn reserve_user_quota_with_yield(
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_rounds = backoff_rounds.saturating_add(1);
         if backoff_rounds >= QUOTA_RESERVE_MAX_BACKOFF_ROUNDS {
+            stats.increment_quota_contention_timeout_total();
             return Err(QuotaReserveError::Contended);
         }
         backoff_ms = backoff_ms
@@ -1656,18 +1661,27 @@ where
                         if let (Some(limit), Some(user_stats)) =
                             (quota_limit, quota_user_stats.as_deref())
                         {
-                            if reserve_user_quota_with_yield(
+                            match reserve_user_quota_with_yield(
                                 user_stats,
                                 payload.len() as u64,
                                 limit,
+                                stats.as_ref(),
                             )
                             .await
-                            .is_err()
                             {
-                                main_result = Err(ProxyError::DataQuotaExceeded {
-                                    user: user.clone(),
-                                });
-                                break;
+                                Ok(_) => {}
+                                Err(QuotaReserveError::LimitExceeded) => {
+                                    main_result = Err(ProxyError::DataQuotaExceeded {
+                                        user: user.clone(),
+                                    });
+                                    break;
+                                }
+                                Err(QuotaReserveError::Contended) => {
+                                    main_result = Err(ProxyError::Proxy(
+                                        "ME C->ME quota reservation contended".into(),
+                                    ));
+                                    break;
+                                }
                             }
                             stats.add_user_octets_from_handle(user_stats, payload.len() as u64);
                         } else {
@@ -1741,6 +1755,8 @@ where
             joined.unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME sender join error: {e}"))))
         }
         Err(_) => {
+            stats.increment_me_child_join_timeout_total();
+            stats.increment_me_child_abort_total();
             c2me_sender.abort();
             Err(ProxyError::Proxy("ME sender join timeout".into()))
         }
@@ -1752,6 +1768,8 @@ where
             joined.unwrap_or_else(|e| Err(ProxyError::Proxy(format!("ME writer join error: {e}"))))
         }
         Err(_) => {
+            stats.increment_me_child_join_timeout_total();
+            stats.increment_me_child_abort_total();
             me_writer.abort();
             Err(ProxyError::Proxy("ME writer join timeout".into()))
         }
@@ -2357,14 +2375,19 @@ where
             let data_len = data.len() as u64;
             if let (Some(limit), Some(user_stats)) = (quota_limit, quota_user_stats) {
                 let soft_limit = quota_soft_cap(limit, quota_soft_overshoot_bytes);
-                if reserve_user_quota_with_yield(user_stats, data_len, soft_limit)
-                    .await
-                    .is_err()
-                {
-                    stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
-                    return Err(ProxyError::DataQuotaExceeded {
-                        user: user.to_string(),
-                    });
+                match reserve_user_quota_with_yield(user_stats, data_len, soft_limit, stats).await {
+                    Ok(_) => {}
+                    Err(QuotaReserveError::LimitExceeded) => {
+                        stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
+                        return Err(ProxyError::DataQuotaExceeded {
+                            user: user.to_string(),
+                        });
+                    }
+                    Err(QuotaReserveError::Contended) => {
+                        return Err(ProxyError::Proxy(
+                            "ME D->C quota reservation contended".into(),
+                        ));
+                    }
                 }
             }
             wait_for_traffic_budget(traffic_lease, RateDirection::Down, data_len).await;

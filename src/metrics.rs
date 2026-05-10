@@ -741,6 +741,52 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_quota_refund_bytes_total Reserved quota bytes returned before commit"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_refund_bytes_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_refund_bytes_total {}",
+        if core_enabled {
+            stats.get_quota_refund_bytes_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_contention_total Quota reservation CAS contention events"
+    );
+    let _ = writeln!(out, "# TYPE telemt_quota_contention_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_quota_contention_total {}",
+        if core_enabled {
+            stats.get_quota_contention_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_quota_contention_timeout_total Quota reservations that hit the bounded contention budget"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_quota_contention_timeout_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_quota_contention_timeout_total {}",
+        if core_enabled {
+            stats.get_quota_contention_timeout_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_conntrack_control_state Runtime conntrack control state flags"
     );
     let _ = writeln!(out, "# TYPE telemt_conntrack_control_state gauge");
@@ -1951,6 +1997,34 @@ async fn render_metrics(
         "telemt_me_d2c_quota_reject_total{{stage=\"post_write\"}} {}",
         if me_allows_normal {
             stats.get_me_d2c_quota_reject_post_write_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_child_join_timeout_total Middle relay child tasks that did not join before cleanup deadline"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_child_join_timeout_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_child_join_timeout_total {}",
+        if core_enabled {
+            stats.get_me_child_join_timeout_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_child_abort_total Middle relay child tasks aborted after bounded cleanup timeout"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_child_abort_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_child_abort_total {}",
+        if core_enabled {
+            stats.get_me_child_abort_total()
         } else {
             0
         }
