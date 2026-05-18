@@ -105,6 +105,7 @@ set_language() {
             L_OUT_UNINST_H="УДАЛЕНИЕ ЗАВЕРШЕНО"
             L_OUT_LINK="Ваша ссылка для подключения к Telegram Proxy:\n"
             L_ERR_INCORR_ROOT_LOGIN="Используйте 'su -' или 'sudo -i' для входа под пользователем root"
+            L_OUT_LOGS="Чтобы посмотреть логи (в случае проблем), используйте команду:"
             ;;
         *)
             L_ERR_DOMAIN_REQ="requires a domain argument."
@@ -180,6 +181,7 @@ set_language() {
             L_OUT_UNINST_H="UNINSTALLATION COMPLETE"
             L_OUT_LINK="Your Telegram Proxy connection link:\n"
             L_ERR_INCORR_ROOT_LOGIN="Use 'su -' or 'sudo -i' to login under root"
+            L_OUT_LOGS="To view logs (in case of issues), use the following command:"
             ;;
     esac
 }
@@ -392,7 +394,7 @@ verify_common() {
 
     if [ "$(id -u)" -eq 0 ]; then
         SUDO=""
-        if [ "$(id -u)" -ne 0 ]; then
+        if [ "${USER:-}" != "root" ] && [ "${LOGNAME:-}" != "root" ]; then
             die "$L_ERR_INCORR_ROOT_LOGIN"
         fi
     else
@@ -539,7 +541,7 @@ install_binary() {
     fi
 
     $SUDO mkdir -p "$INSTALL_DIR" || die "$L_ERR_MKDIR"
-    
+
     $SUDO rm -f "$bin_dst" 2>/dev/null || true
 
     if command -v install >/dev/null 2>&1; then
@@ -609,33 +611,33 @@ install_config() {
 
         tmp_conf="${TEMP_DIR}/config.tmp"
         $SUDO cat "$CONFIG_FILE" > "$tmp_conf"
-        
+
         escaped_domain="$(printf '%s\n' "$TLS_DOMAIN" | tr -d '[:cntrl:]' | sed 's/\\/\\\\/g; s/"/\\"/g')"
 
         awk -v port="$SERVER_PORT" -v secret="$USER_SECRET" -v domain="$escaped_domain" -v ad_tag="$AD_TAG" \
             -v flag_p="$PORT_PROVIDED" -v flag_s="$SECRET_PROVIDED" -v flag_d="$DOMAIN_PROVIDED" -v flag_a="$AD_TAG_PROVIDED" '
         BEGIN { ad_tag_handled = 0 }
-        
+
         flag_p == "1" && /^[ \t]*port[ \t]*=/ { print "port = " port; next }
         flag_s == "1" && /^[ \t]*hello[ \t]*=/ { print "hello = \"" secret "\""; next }
         flag_d == "1" && /^[ \t]*tls_domain[ \t]*=/ { print "tls_domain = \"" domain "\""; next }
-        
-        flag_a == "1" && /^[ \t]*ad_tag[ \t]*=/ { 
-            if (!ad_tag_handled) { 
-                print "ad_tag = \"" ad_tag "\""; 
-                ad_tag_handled = 1; 
-            } 
-            next 
+
+        flag_a == "1" && /^[ \t]*ad_tag[ \t]*=/ {
+            if (!ad_tag_handled) {
+                print "ad_tag = \"" ad_tag "\"";
+                ad_tag_handled = 1;
+            }
+            next
         }
-        flag_a == "1" && /^\[general\]/ { 
-            print; 
-            if (!ad_tag_handled) { 
-                print "ad_tag = \"" ad_tag "\""; 
-                ad_tag_handled = 1; 
-            } 
-            next 
+        flag_a == "1" && /^\[general\]/ {
+            print;
+            if (!ad_tag_handled) {
+                print "ad_tag = \"" ad_tag "\"";
+                ad_tag_handled = 1;
+            }
+            next
         }
-        
+
         { print }
         ' "$tmp_conf" > "${tmp_conf}.new" && mv "${tmp_conf}.new" "$tmp_conf"
 
@@ -785,11 +787,11 @@ uninstall() {
         say "$L_U_STAGE_5"
         $SUDO rm -rf "$CONFIG_DIR" "$WORK_DIR"
         $SUDO rm -f "$CONFIG_FILE"
-        
+
         if check_os_entity passwd telemt; then
             $SUDO userdel telemt 2>/dev/null || $SUDO deluser telemt 2>/dev/null || true
         fi
-        
+
         if check_os_entity group telemt; then
             $SUDO groupdel telemt 2>/dev/null || $SUDO delgroup telemt 2>/dev/null || true
         fi
@@ -916,7 +918,7 @@ case "$ACTION" in
         if command -v curl >/dev/null 2>&1; then SERVER_IP="$(curl -s4 -m 3 ifconfig.me 2>/dev/null || curl -s4 -m 3 api.ipify.org 2>/dev/null || true)"
         elif command -v wget >/dev/null 2>&1; then SERVER_IP="$(wget -qO- -T 3 ifconfig.me 2>/dev/null || wget -qO- -T 3 api.ipify.org 2>/dev/null || true)"; fi
         [ -z "$SERVER_IP" ] && SERVER_IP="<YOUR_SERVER_IP>"
-        
+
         if command -v xxd >/dev/null 2>&1; then HEX_DOMAIN="$(printf '%s' "$TLS_DOMAIN" | xxd -p | tr -d '\n')"
         elif command -v hexdump >/dev/null 2>&1; then HEX_DOMAIN="$(printf '%s' "$TLS_DOMAIN" | hexdump -v -e '/1 "%02x"')"
         elif command -v od >/dev/null 2>&1; then HEX_DOMAIN="$(printf '%s' "$TLS_DOMAIN" | od -A n -t x1 | tr -d ' \n')"
@@ -926,6 +928,15 @@ case "$ACTION" in
 
         printf '%b\n' "$L_OUT_LINK"
         printf '  tg://proxy?server=%s&port=%s&secret=%s\n\n' "$SERVER_IP" "$SERVER_PORT" "$CLIENT_SECRET"
+
+        svc="$(get_svc_mgr)"
+        if [ "$svc" = "systemd" ]; then
+            printf '%s\n' "$L_OUT_LOGS"
+            printf '  sudo journalctl -u %s -f\n\n' "$SERVICE_NAME"
+        elif [ "$svc" = "openrc" ]; then
+            printf '%s\n' "$L_OUT_LOGS"
+            printf '  sudo tail -f /var/log/messages /var/log/syslog 2>/dev/null | grep -i %s\n\n' "$SERVICE_NAME"
+        fi
 
         printf '====================================================================\n'
         ;;
