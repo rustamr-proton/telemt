@@ -52,6 +52,10 @@ By submitting a PR, you confirm that:
 
 AI-generated code is treated as **draft** and must be validated like any other external contribution.
 
+The problem isn’t AI as a tool, but the dilution of responsibility. If the commit history says "Claude/GPT authored this", then who is accountable for the bug? Claude? GPT? Anthropic? OpenAI? Samuel Altman?
+
+The user who didn’t read the diff? No one? But, in a sensitive system, *"no one"* is an unacceptable maintainer model.
+
 PRs that look like unverified AI dumps WILL be closed
 
 ---
