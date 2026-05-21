@@ -4,6 +4,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::crypto::{AesCbc, crc32, crc32c};
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
+use crate::stream::PooledBuffer;
+
+use super::wire::{append_proxy_req_payload_into, proxy_req_payload_len};
 
 const RPC_WRITER_FRAME_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
 const RPC_WRITER_FRAME_BUF_RETAIN: usize = 64 * 1024;
@@ -12,8 +15,19 @@ const RPC_WRITER_FRAME_BUF_RETAIN: usize = 64 * 1024;
 pub(crate) enum WriterCommand {
     Data(Bytes),
     DataAndFlush(Bytes),
+    ProxyReq(ProxyReqCommand),
     ControlAndFlush([u8; 12]),
     Close,
+}
+
+/// Structured proxy request command that lets the writer encode directly into its frame buffer.
+pub(crate) struct ProxyReqCommand {
+    pub(crate) conn_id: u64,
+    pub(crate) client_addr: std::net::SocketAddr,
+    pub(crate) our_addr: std::net::SocketAddr,
+    pub(crate) proto_flags: u32,
+    pub(crate) proxy_tag: Option<[u8; 16]>,
+    pub(crate) payload: PooledBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +263,37 @@ impl RpcWriter {
     pub(crate) async fn send(&mut self, payload: &[u8]) -> Result<()> {
         build_rpc_frame_into(&mut self.frame_buf, self.seq_no, payload, self.crc_mode);
         self.seq_no = self.seq_no.wrapping_add(1);
+        self.encrypt_and_write_frame().await
+    }
 
+    pub(crate) async fn send_proxy_req(&mut self, command: &ProxyReqCommand) -> Result<()> {
+        let payload_len = proxy_req_payload_len(
+            command.payload.len(),
+            command.proxy_tag.as_ref().map(|tag| tag.as_slice()),
+            command.proto_flags,
+        );
+        let total_len = 4 + 4 + payload_len + 4;
+        self.frame_buf.clear();
+        self.frame_buf.reserve(total_len + 15);
+        self.frame_buf
+            .extend_from_slice(&(total_len as u32).to_le_bytes());
+        self.frame_buf.extend_from_slice(&self.seq_no.to_le_bytes());
+        append_proxy_req_payload_into(
+            &mut self.frame_buf,
+            command.conn_id,
+            command.client_addr,
+            command.our_addr,
+            command.payload.as_ref(),
+            command.proxy_tag.as_ref().map(|tag| tag.as_slice()),
+            command.proto_flags,
+        );
+        let c = rpc_crc(self.crc_mode, &self.frame_buf);
+        self.frame_buf.extend_from_slice(&c.to_le_bytes());
+        self.seq_no = self.seq_no.wrapping_add(1);
+        self.encrypt_and_write_frame().await
+    }
+
+    async fn encrypt_and_write_frame(&mut self) -> Result<()> {
         let pad = (16 - (self.frame_buf.len() % 16)) % 16;
         let pad_pattern: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
         for i in 0..pad {

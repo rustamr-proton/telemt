@@ -57,7 +57,10 @@ fn normalize_mask_host_to_ascii(host: &str, field: &str) -> Result<String> {
     if host.starts_with('[') && host.ends_with(']') {
         let inner = &host[1..host.len() - 1];
         let ip = inner.parse::<std::net::IpAddr>().map_err(|_| {
-            ProxyError::Config(format!("Invalid {field}: '{}'. IPv6 literal is invalid", host))
+            ProxyError::Config(format!(
+                "Invalid {field}: '{}'. IPv6 literal is invalid",
+                host
+            ))
         })?;
         return match ip {
             std::net::IpAddr::V6(v6) => Ok(format!("[{v6}]")),
@@ -2063,18 +2066,29 @@ impl ProxyConfig {
         }
 
         let mut exclusive_mask = HashMap::with_capacity(config.censorship.exclusive_mask.len());
+        let mut exclusive_mask_targets =
+            HashMap::with_capacity(config.censorship.exclusive_mask.len());
         for (domain, target) in std::mem::take(&mut config.censorship.exclusive_mask) {
-            let domain = normalize_domain_to_ascii(
-                &domain,
-                "censorship.exclusive_mask domain",
-            )?;
-            let target = normalize_exclusive_mask_target(
-                &target,
-                "censorship.exclusive_mask target",
-            )?;
+            let domain = normalize_domain_to_ascii(&domain, "censorship.exclusive_mask domain")?;
+            let target =
+                normalize_exclusive_mask_target(&target, "censorship.exclusive_mask target")?;
+            let Some((host, port)) = parse_exclusive_mask_target(&target) else {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask target for '{}': '{}'. Expected host:port with port > 0",
+                    domain, target
+                )));
+            };
+            exclusive_mask_targets.insert(
+                domain.clone(),
+                ExclusiveMaskTarget {
+                    host: host.to_string(),
+                    port,
+                },
+            );
             exclusive_mask.insert(domain, target);
         }
         config.censorship.exclusive_mask = exclusive_mask;
+        config.censorship.exclusive_mask_targets = exclusive_mask_targets;
 
         // Migration: prefer_ipv6 -> network.prefer.
         if config.general.prefer_ipv6 {

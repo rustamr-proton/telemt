@@ -515,12 +515,28 @@ fn exclusive_mask_target_for_sni<'a>(
     config: &'a ProxyConfig,
     sni: &str,
 ) -> Option<MaskTcpTarget<'a>> {
+    if let Some(target) = config.censorship.exclusive_mask_targets.get(sni) {
+        return Some(MaskTcpTarget {
+            host: target.host.as_str(),
+            port: target.port,
+        });
+    }
     if let Some(target) = config.censorship.exclusive_mask.get(sni) {
         return parse_exclusive_mask_target(target);
     }
 
     if sni.bytes().any(|byte| byte.is_ascii_uppercase()) {
         let normalized_sni = sni.to_ascii_lowercase();
+        if let Some(target) = config
+            .censorship
+            .exclusive_mask_targets
+            .get(&normalized_sni)
+        {
+            return Some(MaskTcpTarget {
+                host: target.host.as_str(),
+                port: target.port,
+            });
+        }
         if let Some(target) = config.censorship.exclusive_mask.get(&normalized_sni) {
             return parse_exclusive_mask_target(target);
         }

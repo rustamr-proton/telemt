@@ -358,6 +358,7 @@ where
                 delay_ms = delay.as_millis() as u64,
                 "Cutover affected direct session, closing client connection"
             );
+            let _cutover_park_lease = stats.acquire_direct_cutover_park_lease();
             tokio::time::sleep(delay).await;
             break Err(ProxyError::RouteSwitched);
         }

@@ -728,6 +728,37 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_route_cutover_parked_current Sessions currently parked in route cutover stagger delay"
+    );
+    let _ = writeln!(out, "# TYPE telemt_route_cutover_parked_current gauge");
+    let _ = writeln!(
+        out,
+        "telemt_route_cutover_parked_current{{route=\"direct\"}} {}",
+        stats.get_route_cutover_parked_direct_current()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_route_cutover_parked_current{{route=\"middle\"}} {}",
+        stats.get_route_cutover_parked_middle_current()
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_route_cutover_parked_total Sessions parked in route cutover stagger delay"
+    );
+    let _ = writeln!(out, "# TYPE telemt_route_cutover_parked_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_route_cutover_parked_total{{route=\"direct\"}} {}",
+        stats.get_route_cutover_parked_direct_total()
+    );
+    let _ = writeln!(
+        out,
+        "telemt_route_cutover_parked_total{{route=\"middle\"}} {}",
+        stats.get_route_cutover_parked_middle_total()
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_quota_refund_bytes_total Reserved quota bytes returned before commit"
     );
     let _ = writeln!(out, "# TYPE telemt_quota_refund_bytes_total counter");

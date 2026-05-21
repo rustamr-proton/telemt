@@ -42,22 +42,45 @@ fn append_mapped_addr_and_port(buf: &mut Vec<u8>, addr: SocketAddr) {
     buf.extend_from_slice(&(addr.port() as u32).to_le_bytes());
 }
 
-pub(crate) fn build_proxy_req_payload(
+fn proxy_tag_wire_len(tag: &[u8]) -> usize {
+    if tag.len() < 254 {
+        4 + 1 + tag.len() + ((4 - ((1 + tag.len()) % 4)) % 4)
+    } else {
+        4 + 4 + tag.len() + ((4 - (tag.len() % 4)) % 4)
+    }
+}
+
+/// Returns the exact unencrypted RPC_PROXY_REQ payload length for pre-sizing frame buffers.
+pub(crate) fn proxy_req_payload_len(
+    data_len: usize,
+    proxy_tag: Option<&[u8]>,
+    proto_flags: u32,
+) -> usize {
+    let base_len = 4 + 4 + 8 + 20 + 20;
+    let extra_len = if proto_flags & RPC_FLAG_HAS_AD_TAG != 0 {
+        4 + proxy_tag.map(proxy_tag_wire_len).unwrap_or(0)
+    } else {
+        0
+    };
+    base_len + extra_len + data_len
+}
+
+/// Appends RPC_PROXY_REQ payload bytes without allocating an intermediate payload buffer.
+pub(crate) fn append_proxy_req_payload_into(
+    b: &mut Vec<u8>,
     conn_id: u64,
     client_addr: SocketAddr,
     our_addr: SocketAddr,
     data: &[u8],
     proxy_tag: Option<&[u8]>,
     proto_flags: u32,
-) -> Bytes {
-    let mut b = Vec::with_capacity(128 + data.len());
-
+) {
     b.extend_from_slice(&RPC_PROXY_REQ_U32.to_le_bytes());
     b.extend_from_slice(&proto_flags.to_le_bytes());
     b.extend_from_slice(&conn_id.to_le_bytes());
 
-    append_mapped_addr_and_port(&mut b, client_addr);
-    append_mapped_addr_and_port(&mut b, our_addr);
+    append_mapped_addr_and_port(b, client_addr);
+    append_mapped_addr_and_port(b, our_addr);
 
     if proto_flags & RPC_FLAG_HAS_AD_TAG != 0 {
         let extra_start = b.len();
@@ -86,6 +109,26 @@ pub(crate) fn build_proxy_req_payload(
     }
 
     b.extend_from_slice(data);
+}
+
+pub(crate) fn build_proxy_req_payload(
+    conn_id: u64,
+    client_addr: SocketAddr,
+    our_addr: SocketAddr,
+    data: &[u8],
+    proxy_tag: Option<&[u8]>,
+    proto_flags: u32,
+) -> Bytes {
+    let mut b = Vec::with_capacity(128 + data.len());
+    append_proxy_req_payload_into(
+        &mut b,
+        conn_id,
+        client_addr,
+        our_addr,
+        data,
+        proxy_tag,
+        proto_flags,
+    );
     Bytes::from(b)
 }
 

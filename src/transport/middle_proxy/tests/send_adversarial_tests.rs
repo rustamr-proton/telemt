@@ -165,6 +165,7 @@ async fn recv_data_count(rx: &mut mpsc::Receiver<WriterCommand>, budget: Duratio
         match tokio::time::timeout(remaining.min(Duration::from_millis(10)), rx.recv()).await {
             Ok(Some(WriterCommand::Data(_))) => data_count += 1,
             Ok(Some(WriterCommand::DataAndFlush(_))) => data_count += 1,
+            Ok(Some(WriterCommand::ProxyReq(_))) => data_count += 1,
             Ok(Some(WriterCommand::ControlAndFlush(_))) => data_count += 1,
             Ok(Some(WriterCommand::Close)) => {}
             Ok(None) => break,

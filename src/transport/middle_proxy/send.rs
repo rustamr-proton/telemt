@@ -1,7 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,16 +9,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
+use super::MePool;
+use super::codec::{ProxyReqCommand, WriterCommand};
+use super::registry::ConnMeta;
+use super::wire::build_proxy_req_payload;
 use crate::config::{MeRouteNoWriterMode, MeWriterPickMode};
 use crate::error::{ProxyError, Result};
 use crate::network::IpFamily;
-use crate::protocol::constants::{RPC_CLOSE_CONN_U32, RPC_CLOSE_EXT_U32};
-
-use super::MePool;
-use super::codec::{WriterCommand, build_control_payload};
-use super::pool::WriterContour;
-use super::registry::ConnMeta;
-use super::wire::build_proxy_req_payload;
+use crate::stream::PooledBuffer;
 use rand::seq::SliceRandom;
 
 const IDLE_WRITER_PENALTY_MID_SECS: u64 = 45;
@@ -32,6 +29,21 @@ const PICK_PENALTY_WARM: u64 = 200;
 const PICK_PENALTY_DRAINING: u64 = 600;
 const PICK_PENALTY_STALE: u64 = 300;
 const PICK_PENALTY_DEGRADED: u64 = 250;
+
+mod close;
+mod recovery;
+mod selection;
+
+fn proxy_tag_array(tag: Option<&[u8]>) -> Option<[u8; 16]> {
+    tag.and_then(|tag| <[u8; 16]>::try_from(tag).ok())
+}
+
+fn proxy_req_payload_from_command(cmd: WriterCommand) -> Option<PooledBuffer> {
+    match cmd {
+        WriterCommand::ProxyReq(command) => Some(command.payload),
+        _ => None,
+    }
+}
 
 impl MePool {
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
@@ -84,14 +96,10 @@ impl MePool {
         let mut hybrid_wait_current = hybrid_wait_step;
 
         loop {
-            if let Some((current, current_meta)) =
-                self.registry.get_writer_with_meta(conn_id).await
+            if let Some((current, current_meta)) = self.registry.get_writer_with_meta(conn_id).await
             {
                 let (current_payload, _) = build_routed_payload(current_meta.our_addr);
-                match current
-                    .tx
-                    .try_send(WriterCommand::Data(current_payload))
-                {
+                match current.tx.try_send(WriterCommand::Data(current_payload)) {
                     Ok(()) => {
                         self.note_hybrid_route_success();
                         return Ok(());
@@ -528,401 +536,93 @@ impl MePool {
         }
     }
 
-    async fn wait_for_writer_until(&self, deadline: Instant) -> bool {
-        let mut rx = self.writer_epoch.subscribe();
-        if !self.writers.read().await.is_empty() {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return !self.writers.read().await.is_empty();
-        }
-        let timeout = deadline.saturating_duration_since(now);
-        if tokio::time::timeout(timeout, rx.changed()).await.is_ok() {
-            return !self.writers.read().await.is_empty();
-        }
-        !self.writers.read().await.is_empty()
-    }
-
-    async fn wait_for_candidate_until(&self, routed_dc: i32, deadline: Instant) -> bool {
-        let mut rx = self.writer_epoch.subscribe();
-        loop {
-            if self.has_candidate_for_target_dc(routed_dc).await {
-                return true;
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
-                return self.has_candidate_for_target_dc(routed_dc).await;
-            }
-
-            if self.has_candidate_for_target_dc(routed_dc).await {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return self.has_candidate_for_target_dc(routed_dc).await;
-            }
-            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-                return self.has_candidate_for_target_dc(routed_dc).await;
-            }
-        }
-    }
-
-    async fn has_candidate_for_target_dc(&self, routed_dc: i32) -> bool {
-        let writers_snapshot = {
-            let ws = self.writers.read().await;
-            if ws.is_empty() {
-                return false;
-            }
-            ws.clone()
-        };
-        let mut candidate_indices = self
-            .candidate_indices_for_dc(&writers_snapshot, routed_dc, false)
-            .await;
-        if candidate_indices.is_empty() {
-            candidate_indices = self
-                .candidate_indices_for_dc(&writers_snapshot, routed_dc, true)
-                .await;
-        }
-        !candidate_indices.is_empty()
-    }
-
-    async fn trigger_async_recovery_for_target_dc(self: &Arc<Self>, routed_dc: i32) -> bool {
-        let endpoints = self.endpoint_candidates_for_target_dc(routed_dc).await;
-        if endpoints.is_empty() {
-            return false;
-        }
-        self.stats.increment_me_async_recovery_trigger_total();
-        for addr in endpoints.into_iter().take(8) {
-            self.trigger_immediate_refill_for_dc(addr, routed_dc);
-        }
-        true
-    }
-
-    async fn trigger_async_recovery_global(self: &Arc<Self>) {
-        self.stats.increment_me_async_recovery_trigger_total();
-        let mut seen = HashSet::<(i32, SocketAddr)>::new();
-        for family in self.family_order() {
-            let map_guard = match family {
-                IpFamily::V4 => self.proxy_map_v4.read().await,
-                IpFamily::V6 => self.proxy_map_v6.read().await,
-            };
-            for (dc, addrs) in map_guard.iter() {
-                for (ip, port) in addrs {
-                    let addr = SocketAddr::new(*ip, *port);
-                    if seen.insert((*dc, addr)) {
-                        self.trigger_immediate_refill_for_dc(addr, *dc);
-                    }
-                    if seen.len() >= 8 {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn endpoint_candidates_for_target_dc(&self, routed_dc: i32) -> Vec<SocketAddr> {
-        self.preferred_endpoints_for_dc(routed_dc).await
-    }
-
-    async fn maybe_trigger_hybrid_recovery(
+    /// Send RPC_PROXY_REQ while keeping the first bound-writer path allocation-light.
+    pub async fn send_proxy_req_pooled(
         self: &Arc<Self>,
-        routed_dc: i32,
-        hybrid_recovery_round: &mut u32,
-        hybrid_last_recovery_at: &mut Option<Instant>,
-        hybrid_wait_step: Duration,
-    ) {
-        if !self.try_consume_hybrid_recovery_trigger_slot(HYBRID_RECOVERY_TRIGGER_MIN_INTERVAL_MS) {
-            return;
-        }
-        if let Some(last) = *hybrid_last_recovery_at
-            && last.elapsed() < hybrid_wait_step
-        {
-            return;
-        }
+        conn_id: u64,
+        target_dc: i16,
+        client_addr: SocketAddr,
+        our_addr: SocketAddr,
+        payload: PooledBuffer,
+        proto_flags: u32,
+        tag_override: Option<[u8; 16]>,
+    ) -> Result<()> {
+        let tag = tag_override.or_else(|| proxy_tag_array(self.proxy_tag.as_deref()));
 
-        let round = *hybrid_recovery_round;
-        let target_triggered = self.trigger_async_recovery_for_target_dc(routed_dc).await;
-        if !target_triggered || round.is_multiple_of(HYBRID_GLOBAL_BURST_PERIOD_ROUNDS) {
-            self.trigger_async_recovery_global().await;
-        }
-        *hybrid_recovery_round = round.saturating_add(1);
-        *hybrid_last_recovery_at = Some(Instant::now());
-    }
-
-    fn hybrid_total_wait_budget(&self) -> Duration {
-        let base = self
-            .route_runtime
-            .me_route_hybrid_max_wait
-            .max(Duration::from_millis(50));
-        let now_ms = Self::now_epoch_millis();
-        let last_success_ms = self
-            .route_runtime
-            .me_route_last_success_epoch_ms
-            .load(Ordering::Relaxed);
-        if last_success_ms != 0
-            && now_ms.saturating_sub(last_success_ms) <= HYBRID_RECENT_SUCCESS_WINDOW_MS
-        {
-            return base.saturating_mul(2);
-        }
-        base
-    }
-
-    fn note_hybrid_route_success(&self) {
-        self.route_runtime
-            .me_route_last_success_epoch_ms
-            .store(Self::now_epoch_millis(), Ordering::Relaxed);
-    }
-
-    fn on_hybrid_timeout(&self, deadline: Instant, routed_dc: i32) {
-        self.stats.increment_me_hybrid_timeout_total();
-        let now_ms = Self::now_epoch_millis();
-        let mut last_warn_ms = self
-            .route_runtime
-            .me_route_hybrid_timeout_warn_epoch_ms
-            .load(Ordering::Relaxed);
-        while now_ms.saturating_sub(last_warn_ms) >= HYBRID_TIMEOUT_WARN_RATE_LIMIT_MS {
-            match self
-                .route_runtime
-                .me_route_hybrid_timeout_warn_epoch_ms
-                .compare_exchange_weak(last_warn_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    warn!(
-                        routed_dc,
-                        budget_ms = self.hybrid_total_wait_budget().as_millis() as u64,
-                        elapsed_ms = deadline.elapsed().as_millis() as u64,
-                        "ME hybrid route timeout reached"
-                    );
-                    break;
+        if let Some((current, current_meta)) = self.registry.get_writer_with_meta(conn_id).await {
+            let command = WriterCommand::ProxyReq(ProxyReqCommand {
+                conn_id,
+                client_addr,
+                our_addr: current_meta.our_addr,
+                proto_flags,
+                proxy_tag: tag,
+                payload,
+            });
+            match current.tx.try_send(command) {
+                Ok(()) => {
+                    self.note_hybrid_route_success();
+                    return Ok(());
                 }
-                Err(actual) => last_warn_ms = actual,
-            }
-        }
-    }
-
-    fn try_consume_hybrid_recovery_trigger_slot(&self, min_interval_ms: u64) -> bool {
-        let now_ms = Self::now_epoch_millis();
-        let mut last_trigger_ms = self
-            .route_runtime
-            .me_async_recovery_last_trigger_epoch_ms
-            .load(Ordering::Relaxed);
-        loop {
-            if now_ms.saturating_sub(last_trigger_ms) < min_interval_ms {
-                return false;
-            }
-            match self
-                .route_runtime
-                .me_async_recovery_last_trigger_epoch_ms
-                .compare_exchange_weak(last_trigger_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(actual) => last_trigger_ms = actual,
-            }
-        }
-    }
-
-    pub async fn send_close(self: &Arc<Self>, conn_id: u64) -> Result<()> {
-        if let Some(w) = self.registry.get_writer(conn_id).await {
-            let payload = build_control_payload(RPC_CLOSE_EXT_U32, conn_id);
-            if w.tx
-                .send(WriterCommand::ControlAndFlush(payload))
-                .await
-                .is_err()
-            {
-                debug!("ME close write failed");
-                self.remove_writer_and_close_clients(w.writer_id).await;
-            }
-        } else {
-            debug!(conn_id, "ME close skipped (writer missing)");
-        }
-
-        self.registry.unregister(conn_id).await;
-        Ok(())
-    }
-
-    pub async fn send_close_conn(self: &Arc<Self>, conn_id: u64) -> Result<()> {
-        if let Some(w) = self.registry.get_writer(conn_id).await {
-            let payload = build_control_payload(RPC_CLOSE_CONN_U32, conn_id);
-            match w.tx.try_send(WriterCommand::ControlAndFlush(payload)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(cmd)) => {
-                    let _ = tokio::time::timeout(Duration::from_millis(50), w.tx.send(cmd)).await;
-                }
-                Err(TrySendError::Closed(_)) => {
-                    debug!(conn_id, "ME close_conn skipped: writer channel closed");
+                Err(TrySendError::Full(cmd)) => match current.tx.send(cmd).await {
+                    Ok(()) => {
+                        self.note_hybrid_route_success();
+                        return Ok(());
+                    }
+                    Err(send_err) => {
+                        let Some(payload) = proxy_req_payload_from_command(send_err.0) else {
+                            return Err(ProxyError::Proxy(
+                                "ME writer rejected unexpected command type".into(),
+                            ));
+                        };
+                        warn!(writer_id = current.writer_id, "ME writer channel closed");
+                        self.remove_writer_and_close_clients(current.writer_id)
+                            .await;
+                        return self
+                            .send_proxy_req(
+                                conn_id,
+                                target_dc,
+                                client_addr,
+                                our_addr,
+                                payload.as_ref(),
+                                proto_flags,
+                                tag.as_ref().map(|tag| tag.as_slice()),
+                            )
+                            .await;
+                    }
+                },
+                Err(TrySendError::Closed(cmd)) => {
+                    let Some(payload) = proxy_req_payload_from_command(cmd) else {
+                        return Err(ProxyError::Proxy(
+                            "ME writer rejected unexpected command type".into(),
+                        ));
+                    };
+                    warn!(writer_id = current.writer_id, "ME writer channel closed");
+                    self.remove_writer_and_close_clients(current.writer_id)
+                        .await;
+                    return self
+                        .send_proxy_req(
+                            conn_id,
+                            target_dc,
+                            client_addr,
+                            our_addr,
+                            payload.as_ref(),
+                            proto_flags,
+                            tag.as_ref().map(|tag| tag.as_slice()),
+                        )
+                        .await;
                 }
             }
-        } else {
-            debug!(conn_id, "ME close_conn skipped (writer missing)");
         }
 
-        self.registry.unregister(conn_id).await;
-        Ok(())
-    }
-
-    pub async fn shutdown_send_close_conn_all(self: &Arc<Self>) -> usize {
-        let conn_ids = self.registry.active_conn_ids().await;
-        let total = conn_ids.len();
-        for conn_id in conn_ids {
-            let _ = self.send_close_conn(conn_id).await;
-        }
-        total
-    }
-
-    pub fn connection_count(&self) -> usize {
-        self.conn_count.load(Ordering::Relaxed)
-    }
-
-    pub(super) async fn candidate_indices_for_dc(
-        &self,
-        writers: &[super::pool::MeWriter],
-        routed_dc: i32,
-        include_warm: bool,
-    ) -> Vec<usize> {
-        let preferred = self.preferred_endpoints_for_dc(routed_dc).await;
-        if preferred.is_empty() {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        for (idx, w) in writers.iter().enumerate() {
-            if !self.writer_eligible_for_selection(w, include_warm) {
-                continue;
-            }
-            if w.writer_dc == routed_dc && preferred.contains(&w.addr) {
-                out.push(idx);
-            }
-        }
-        out
-    }
-
-    fn writer_eligible_for_selection(
-        &self,
-        writer: &super::pool::MeWriter,
-        include_warm: bool,
-    ) -> bool {
-        if !self.writer_accepts_new_binding(writer) {
-            return false;
-        }
-
-        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
-            WriterContour::Active => true,
-            WriterContour::Warm => include_warm,
-            WriterContour::Draining => true,
-        }
-    }
-
-    fn writer_contour_rank_for_selection(&self, writer: &super::pool::MeWriter) -> usize {
-        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
-            WriterContour::Active => 0,
-            WriterContour::Warm => 1,
-            WriterContour::Draining => 2,
-        }
-    }
-
-    fn writer_idle_rank_for_selection(
-        &self,
-        writer: &super::pool::MeWriter,
-        idle_since_by_writer: &HashMap<u64, u64>,
-        now_epoch_secs: u64,
-    ) -> usize {
-        let Some(idle_since) = idle_since_by_writer.get(&writer.id).copied() else {
-            return 0;
-        };
-        let idle_age_secs = now_epoch_secs.saturating_sub(idle_since);
-        if idle_age_secs >= IDLE_WRITER_PENALTY_HIGH_SECS {
-            2
-        } else if idle_age_secs >= IDLE_WRITER_PENALTY_MID_SECS {
-            1
-        } else {
-            0
-        }
-    }
-
-    fn writer_pick_score(
-        &self,
-        writer: &super::pool::MeWriter,
-        idle_since_by_writer: &HashMap<u64, u64>,
-        now_epoch_secs: u64,
-    ) -> u64 {
-        let contour_penalty = match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
-            WriterContour::Active => 0,
-            WriterContour::Warm => PICK_PENALTY_WARM,
-            WriterContour::Draining => PICK_PENALTY_DRAINING,
-        };
-        let stale_penalty = if writer.generation < self.current_generation() {
-            PICK_PENALTY_STALE
-        } else {
-            0
-        };
-        let degraded_penalty = if writer.degraded.load(Ordering::Relaxed) {
-            PICK_PENALTY_DEGRADED
-        } else {
-            0
-        };
-        let idle_penalty =
-            (self.writer_idle_rank_for_selection(writer, idle_since_by_writer, now_epoch_secs)
-                as u64)
-                * 100;
-        let queue_cap = self.writer_lifecycle.writer_cmd_channel_capacity.max(1) as u64;
-        let queue_remaining = writer.tx.capacity() as u64;
-        let queue_used = queue_cap.saturating_sub(queue_remaining.min(queue_cap));
-        let queue_util_pct = queue_used.saturating_mul(100) / queue_cap;
-        let queue_penalty = queue_util_pct.saturating_mul(4);
-        let rtt_penalty =
-            ((writer.rtt_ema_ms_x10.load(Ordering::Relaxed) as u64).saturating_add(5) / 10)
-                .min(400);
-
-        contour_penalty
-            .saturating_add(stale_penalty)
-            .saturating_add(degraded_penalty)
-            .saturating_add(idle_penalty)
-            .saturating_add(queue_penalty)
-            .saturating_add(rtt_penalty)
-    }
-
-    fn p2c_ordered_candidate_indices(
-        &self,
-        candidate_indices: &[usize],
-        writers_snapshot: &[super::pool::MeWriter],
-        idle_since_by_writer: &HashMap<u64, u64>,
-        now_epoch_secs: u64,
-        start: usize,
-        sample_size: usize,
-    ) -> Vec<usize> {
-        let total = candidate_indices.len();
-        if total == 0 {
-            return Vec::new();
-        }
-
-        let mut sampled = Vec::<usize>::with_capacity(sample_size.min(total));
-        let mut seen = HashSet::<usize>::with_capacity(total);
-        for offset in 0..sample_size.min(total) {
-            let idx = candidate_indices[(start + offset) % total];
-            if seen.insert(idx) {
-                sampled.push(idx);
-            }
-        }
-
-        sampled.sort_by_key(|idx| {
-            let writer = &writers_snapshot[*idx];
-            (
-                self.writer_pick_score(writer, idle_since_by_writer, now_epoch_secs),
-                writer.addr,
-                writer.id,
-            )
-        });
-
-        let mut ordered = Vec::<usize>::with_capacity(total);
-        ordered.extend(sampled.iter().copied());
-        for offset in 0..total {
-            let idx = candidate_indices[(start + offset) % total];
-            if seen.insert(idx) {
-                ordered.push(idx);
-            }
-        }
-        ordered
+        self.send_proxy_req(
+            conn_id,
+            target_dc,
+            client_addr,
+            our_addr,
+            payload.as_ref(),
+            proto_flags,
+            tag.as_ref().map(|tag| tag.as_slice()),
+        )
+        .await
     }
 }

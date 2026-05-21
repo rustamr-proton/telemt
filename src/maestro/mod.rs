@@ -47,7 +47,9 @@ use crate::stats::{ReplayChecker, Stats};
 use crate::stream::BufferPool;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
-use helpers::{parse_cli, print_maestro_line, resolve_runtime_base_dir, resolve_runtime_config_path};
+use helpers::{
+    parse_cli, print_maestro_line, resolve_runtime_base_dir, resolve_runtime_config_path,
+};
 
 #[cfg(unix)]
 use crate::daemon::{DaemonOptions, PidFile, drop_privileges};
@@ -463,8 +465,7 @@ async fn run_telemt_core(
 
     let (api_config_tx, api_config_rx) = watch::channel(Arc::new(config.clone()));
     let (detected_ips_tx, detected_ips_rx) = watch::channel((None::<IpAddr>, None::<IpAddr>));
-    let initial_direct_first =
-        config.general.use_middle_proxy && config.general.me2dc_fallback;
+    let initial_direct_first = config.general.use_middle_proxy && config.general.me2dc_fallback;
     let initial_admission_open = !config.general.use_middle_proxy || initial_direct_first;
     let (admission_tx, admission_rx) = watch::channel(initial_admission_open);
     let initial_route_mode = if !config.general.use_middle_proxy || initial_direct_first {
@@ -694,7 +695,9 @@ async fn run_telemt_core(
     if direct_first_startup {
         startup_tracker.set_transport_mode("direct").await;
         startup_tracker.set_degraded(true).await;
-        info!("Transport: Direct DC startup fallback active; Middle-End bootstrap continues in background");
+        info!(
+            "Transport: Direct DC startup fallback active; Middle-End bootstrap continues in background"
+        );
     } else if me_pool.is_some() {
         startup_tracker.set_transport_mode("middle_proxy").await;
         startup_tracker.set_degraded(false).await;
@@ -840,7 +843,9 @@ async fn run_telemt_core(
                 if let Some(pool) = api_me_pool_ready.read().await.as_ref() {
                     pool.set_runtime_ready(true);
                 }
-                startup_tracker_ready.set_transport_mode("middle_proxy").await;
+                startup_tracker_ready
+                    .set_transport_mode("middle_proxy")
+                    .await;
                 startup_tracker_ready.set_degraded(false).await;
                 info!("Transport: Middle-End Proxy restored for new sessions");
             }

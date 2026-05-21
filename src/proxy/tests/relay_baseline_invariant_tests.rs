@@ -3,7 +3,9 @@ use crate::error::ProxyError;
 use crate::stats::Stats;
 use crate::stream::BufferPool;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
 use tokio::time::{Duration, timeout};
 

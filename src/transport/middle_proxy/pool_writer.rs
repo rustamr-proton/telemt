@@ -60,6 +60,9 @@ async fn writer_command_loop(
                     Some(WriterCommand::DataAndFlush(payload)) => {
                         rpc_writer.send_and_flush(&payload).await?;
                     }
+                    Some(WriterCommand::ProxyReq(command)) => {
+                        rpc_writer.send_proxy_req(&command).await?;
+                    }
                     Some(WriterCommand::ControlAndFlush(payload)) => {
                         rpc_writer.send_and_flush(&payload).await?;
                     }
