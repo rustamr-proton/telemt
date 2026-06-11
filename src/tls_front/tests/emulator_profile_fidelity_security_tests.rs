@@ -4,7 +4,7 @@ use crate::crypto::SecureRandom;
 use crate::protocol::constants::{
     TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
 };
-use crate::protocol::tls::ClientHelloTlsVersion;
+use crate::protocol::tls::{ClientHelloTlsVersion, TLS_NAMED_GROUP_X25519MLKEM768};
 use crate::tls_front::emulator::build_emulated_server_hello;
 use crate::tls_front::types::{
     CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsProfileSource,
@@ -66,6 +66,7 @@ fn emulated_server_hello_keeps_single_change_cipher_spec_for_client_compatibilit
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         None,
         0,
@@ -91,6 +92,7 @@ fn emulated_server_hello_does_not_emit_profile_ticket_tail_when_disabled() {
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         None,
         0,
@@ -114,6 +116,7 @@ fn emulated_server_hello_uses_profile_ticket_lengths_when_enabled() {
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         None,
         2,

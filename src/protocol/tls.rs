@@ -109,10 +109,21 @@ mod cipher_suite {
     pub const TLS_CHACHA20_POLY1305_SHA256: [u8; 2] = [0x13, 0x03];
 }
 
-/// TLS Named Curves
+/// TLS named groups used in KeyShare extensions.
 mod named_curve {
     pub const X25519: u16 = 0x001d;
+    pub const X25519MLKEM768: u16 = 0x11ec;
 }
+
+/// TLS X25519 named group.
+pub(crate) const TLS_NAMED_GROUP_X25519: u16 = named_curve::X25519;
+/// TLS X25519MLKEM768 named group.
+pub(crate) const TLS_NAMED_GROUP_X25519MLKEM768: u16 = named_curve::X25519MLKEM768;
+
+const X25519_KEY_SHARE_LEN: usize = 32;
+const X25519MLKEM768_CLIENT_KEY_SHARE_LEN: usize = 1216;
+const X25519MLKEM768_SERVER_KEY_SHARE_LEN: usize = 1120;
+const MLKEM768_SERVER_CIPHERTEXT_LEN: usize = 1088;
 
 // ============= TLS Validation Result =============
 
@@ -144,26 +155,28 @@ impl TlsExtensionBuilder {
         }
     }
 
-    /// Add Key Share extension with X25519 key
-    fn add_key_share(&mut self, public_key: &[u8; 32]) -> &mut Self {
+    /// Add KeyShare extension with the selected named group.
+    fn add_key_share(&mut self, group: u16, key_exchange: &[u8]) -> &mut Self {
+        let Ok(key_exchange_len) = u16::try_from(key_exchange.len()) else {
+            return self;
+        };
+        let Some(entry_len) = key_exchange.len().checked_add(4) else {
+            return self;
+        };
+        let Ok(entry_len) = u16::try_from(entry_len) else {
+            return self;
+        };
+
         // Extension type: key_share (0x0033)
         self.extensions
             .extend_from_slice(&extension_type::KEY_SHARE.to_be_bytes());
 
-        // Key share entry: curve (2) + key_len (2) + key (32) = 36 bytes
-        // Extension data length
-        let entry_len: u16 = 2 + 2 + 32; // curve + length + key
+        // ServerHello key_share data is exactly one KeyShareEntry.
         self.extensions.extend_from_slice(&entry_len.to_be_bytes());
-
-        // Named curve: x25519
+        self.extensions.extend_from_slice(&group.to_be_bytes());
         self.extensions
-            .extend_from_slice(&named_curve::X25519.to_be_bytes());
-
-        // Key length
-        self.extensions.extend_from_slice(&(32u16).to_be_bytes());
-
-        // Key data
-        self.extensions.extend_from_slice(public_key);
+            .extend_from_slice(&key_exchange_len.to_be_bytes());
+        self.extensions.extend_from_slice(key_exchange);
 
         self
     }
@@ -232,8 +245,8 @@ impl ServerHelloBuilder {
         }
     }
 
-    fn with_x25519_key(mut self, key: &[u8; 32]) -> Self {
-        self.extensions.add_key_share(key);
+    fn with_key_share(mut self, group: u16, key_exchange: &[u8]) -> Self {
+        self.extensions.add_key_share(group, key_exchange);
         self
     }
 
@@ -508,9 +521,20 @@ fn validate_tls_handshake_at_time_with_boot_cap(
 /// Uses RFC 7748 X25519 scalar multiplication over the canonical basepoint,
 /// yielding distribution-consistent public keys for anti-fingerprinting.
 pub fn gen_fake_x25519_key(rng: &SecureRandom) -> [u8; 32] {
-    let mut scalar = [0u8; 32];
-    scalar.copy_from_slice(&rng.bytes(32));
+    let mut scalar = [0u8; X25519_KEY_SHARE_LEN];
+    scalar.copy_from_slice(&rng.bytes(X25519_KEY_SHARE_LEN));
     x25519(scalar, X25519_BASEPOINT_BYTES)
+}
+
+/// Generate a fake X25519MLKEM768 ServerHello key_share payload.
+pub(crate) fn gen_fake_x25519mlkem768_server_key_share(rng: &SecureRandom) -> Vec<u8> {
+    let mut key_share = vec![0u8; X25519MLKEM768_SERVER_KEY_SHARE_LEN];
+    // FakeTLS never derives TLS traffic secrets from this payload; only the
+    // externally visible named group and vector lengths are protocol-facing.
+    rng.fill(&mut key_share[..MLKEM768_SERVER_CIPHERTEXT_LEN]);
+    let x25519_key = gen_fake_x25519_key(rng);
+    key_share[MLKEM768_SERVER_CIPHERTEXT_LEN..].copy_from_slice(&x25519_key);
+    key_share
 }
 
 /// Build TLS ServerHello response
@@ -537,6 +561,7 @@ pub fn build_server_hello(
         fake_cert_len,
         rng,
         cipher_suite::TLS_AES_128_GCM_SHA256,
+        TLS_NAMED_GROUP_X25519MLKEM768,
         alpn,
         new_session_tickets,
     )
@@ -554,20 +579,30 @@ pub(crate) fn build_server_hello_with_cipher(
     fake_cert_len: usize,
     rng: &SecureRandom,
     selected_cipher_suite: [u8; 2],
+    selected_key_share_group: u16,
     alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     const MIN_APP_DATA: usize = 64;
     const MAX_APP_DATA: usize = MAX_TLS_CIPHERTEXT_SIZE;
     let fake_cert_len = fake_cert_len.clamp(MIN_APP_DATA, MAX_APP_DATA);
-    let x25519_key = gen_fake_x25519_key(rng);
 
     // Build ServerHello
-    let server_hello = ServerHelloBuilder::new(session_id.to_vec())
-        .with_cipher_suite(selected_cipher_suite)
-        .with_x25519_key(&x25519_key)
-        .with_tls13_version()
-        .build_record();
+    let server_hello = if selected_key_share_group == TLS_NAMED_GROUP_X25519MLKEM768 {
+        let key_share = gen_fake_x25519mlkem768_server_key_share(rng);
+        ServerHelloBuilder::new(session_id.to_vec())
+            .with_cipher_suite(selected_cipher_suite)
+            .with_key_share(TLS_NAMED_GROUP_X25519MLKEM768, &key_share)
+            .with_tls13_version()
+            .build_record()
+    } else {
+        let key_share = gen_fake_x25519_key(rng);
+        ServerHelloBuilder::new(session_id.to_vec())
+            .with_cipher_suite(selected_cipher_suite)
+            .with_key_share(TLS_NAMED_GROUP_X25519, &key_share)
+            .with_tls13_version()
+            .build_record()
+    };
 
     // Build Change Cipher Spec record
     let change_cipher_spec = [
@@ -1003,6 +1038,145 @@ fn client_hello_cipher_suites_range(handshake: &[u8]) -> Option<(usize, usize)> 
     Some((pos, cipher_end))
 }
 
+fn client_hello_extensions_range(handshake: &[u8]) -> Option<(usize, usize)> {
+    if handshake.len() < 5 || handshake[0] != TLS_RECORD_HANDSHAKE {
+        return None;
+    }
+
+    let record_len = u16::from_be_bytes([handshake[3], handshake[4]]) as usize;
+    let record_end = 5usize.checked_add(record_len)?;
+    if record_end > handshake.len() {
+        return None;
+    }
+
+    let mut pos = 5;
+    if handshake.get(pos) != Some(&0x01) {
+        return None;
+    }
+    pos += 1;
+
+    if pos + 3 > record_end {
+        return None;
+    }
+    let handshake_len = ((handshake[pos] as usize) << 16)
+        | ((handshake[pos + 1] as usize) << 8)
+        | handshake[pos + 2] as usize;
+    pos += 3;
+    let handshake_end = pos.checked_add(handshake_len)?;
+    if handshake_end > record_end {
+        return None;
+    }
+
+    if pos + 2 + 32 > handshake_end {
+        return None;
+    }
+    pos += 2 + 32;
+
+    let session_id_len = *handshake.get(pos)? as usize;
+    pos = pos.checked_add(1)?.checked_add(session_id_len)?;
+    if pos + 2 > handshake_end {
+        return None;
+    }
+
+    let cipher_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    if cipher_len == 0 || cipher_len % 2 != 0 {
+        return None;
+    }
+    pos += 2;
+    pos = pos.checked_add(cipher_len)?;
+    if pos + 1 > handshake_end {
+        return None;
+    }
+
+    let compression_len = *handshake.get(pos)? as usize;
+    pos = pos.checked_add(1)?.checked_add(compression_len)?;
+    if pos == handshake_end {
+        return Some((handshake_end, handshake_end));
+    }
+    if pos + 2 > handshake_end {
+        return None;
+    }
+
+    let extensions_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    pos += 2;
+    let extensions_end = pos.checked_add(extensions_len)?;
+    if extensions_end > handshake_end {
+        return None;
+    }
+
+    Some((pos, extensions_end))
+}
+
+fn key_share_extension_has_group(
+    data: &[u8],
+    group: u16,
+    expected_key_exchange_len: usize,
+) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+
+    let shares_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if shares_len != data.len().saturating_sub(2) {
+        return false;
+    }
+
+    let mut pos = 2usize;
+    let shares_end = 2 + shares_len;
+    let mut found_group = false;
+    while pos + 4 <= shares_end {
+        let entry_group = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let key_exchange_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let Some(key_exchange_end) = pos.checked_add(key_exchange_len) else {
+            return false;
+        };
+        if key_exchange_end > shares_end {
+            return false;
+        }
+        if entry_group == group && key_exchange_len == expected_key_exchange_len {
+            found_group = true;
+        }
+        pos = key_exchange_end;
+    }
+
+    found_group && pos == shares_end
+}
+
+fn client_hello_offers_key_share_group(
+    handshake: &[u8],
+    group: u16,
+    expected_key_exchange_len: usize,
+) -> bool {
+    let Some((mut pos, extensions_end)) = client_hello_extensions_range(handshake) else {
+        return false;
+    };
+
+    while pos + 4 <= extensions_end {
+        let ext_type = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
+        let ext_len = u16::from_be_bytes([handshake[pos + 2], handshake[pos + 3]]) as usize;
+        pos += 4;
+        let Some(ext_end) = pos.checked_add(ext_len) else {
+            return false;
+        };
+        if ext_end > extensions_end {
+            return false;
+        }
+
+        if ext_type == extension_type::KEY_SHARE {
+            return key_share_extension_has_group(
+                &handshake[pos..ext_end],
+                group,
+                expected_key_exchange_len,
+            );
+        }
+
+        pos = ext_end;
+    }
+
+    false
+}
+
 fn client_hello_offers_cipher_suite(
     handshake: &[u8],
     range: (usize, usize),
@@ -1054,6 +1228,22 @@ pub(crate) fn select_server_hello_cipher_suite(handshake: &[u8], preferred: [u8;
     }
 
     preferred
+}
+
+/// Select the ServerHello key_share named group from the authenticated ClientHello.
+///
+/// Malformed key_share structures intentionally keep the legacy X25519 response
+/// to avoid breaking older clients that do not advertise the hybrid group.
+pub(crate) fn select_server_hello_key_share_group(handshake: &[u8]) -> u16 {
+    if client_hello_offers_key_share_group(
+        handshake,
+        TLS_NAMED_GROUP_X25519MLKEM768,
+        X25519MLKEM768_CLIENT_KEY_SHARE_LEN,
+    ) {
+        TLS_NAMED_GROUP_X25519MLKEM768
+    } else {
+        TLS_NAMED_GROUP_X25519
+    }
 }
 
 /// Check if bytes look like a TLS ClientHello

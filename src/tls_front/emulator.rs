@@ -6,7 +6,9 @@ use crate::protocol::constants::{
     TLS_RECORD_HANDSHAKE, TLS_VERSION,
 };
 use crate::protocol::tls::{
-    ClientHelloTlsVersion, TLS_DIGEST_LEN, TLS_DIGEST_POS, gen_fake_x25519_key,
+    ClientHelloTlsVersion, TLS_DIGEST_LEN, TLS_DIGEST_POS, TLS_NAMED_GROUP_X25519,
+    TLS_NAMED_GROUP_X25519MLKEM768, gen_fake_x25519_key,
+    gen_fake_x25519mlkem768_server_key_share,
 };
 use crate::tls_front::types::{
     CachedTlsData, ParsedCertificateInfo, TlsExtension, TlsProfileSource,
@@ -196,19 +198,43 @@ fn push_supported_versions_extension(extensions: &mut Vec<u8>) {
     extensions.extend_from_slice(&0x0304u16.to_be_bytes());
 }
 
-fn push_key_share_extension(extensions: &mut Vec<u8>, rng: &SecureRandom) {
-    let key = gen_fake_x25519_key(rng);
+fn push_key_share_entry(extensions: &mut Vec<u8>, group: u16, key_exchange: &[u8]) {
+    let Ok(key_exchange_len) = u16::try_from(key_exchange.len()) else {
+        return;
+    };
+    let Some(entry_len) = key_exchange.len().checked_add(4) else {
+        return;
+    };
+    let Ok(entry_len) = u16::try_from(entry_len) else {
+        return;
+    };
+
     extensions.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
-    extensions.extend_from_slice(&(2 + 2 + 32u16).to_be_bytes());
-    extensions.extend_from_slice(&0x001du16.to_be_bytes());
-    extensions.extend_from_slice(&(32u16).to_be_bytes());
-    extensions.extend_from_slice(&key);
+    extensions.extend_from_slice(&entry_len.to_be_bytes());
+    extensions.extend_from_slice(&group.to_be_bytes());
+    extensions.extend_from_slice(&key_exchange_len.to_be_bytes());
+    extensions.extend_from_slice(key_exchange);
+}
+
+fn push_key_share_extension(
+    extensions: &mut Vec<u8>,
+    rng: &SecureRandom,
+    selected_key_share_group: u16,
+) {
+    if selected_key_share_group == TLS_NAMED_GROUP_X25519MLKEM768 {
+        let key = gen_fake_x25519mlkem768_server_key_share(rng);
+        push_key_share_entry(extensions, TLS_NAMED_GROUP_X25519MLKEM768, &key);
+    } else {
+        let key = gen_fake_x25519_key(rng);
+        push_key_share_entry(extensions, TLS_NAMED_GROUP_X25519, &key);
+    }
 }
 
 fn replay_profiled_server_hello_extension(
     ext: &TlsExtension,
     extensions: &mut Vec<u8>,
     rng: &SecureRandom,
+    selected_key_share_group: u16,
     saw_supported_versions: &mut bool,
     saw_key_share: &mut bool,
 ) {
@@ -218,7 +244,7 @@ fn replay_profiled_server_hello_extension(
             *saw_supported_versions = true;
         }
         EXT_KEY_SHARE if !*saw_key_share => {
-            push_key_share_extension(extensions, rng);
+            push_key_share_extension(extensions, rng, selected_key_share_group);
             *saw_key_share = true;
         }
         EXT_ALPN => {}
@@ -226,7 +252,11 @@ fn replay_profiled_server_hello_extension(
     }
 }
 
-fn build_profiled_server_hello_extensions(cached: &CachedTlsData, rng: &SecureRandom) -> Vec<u8> {
+fn build_profiled_server_hello_extensions(
+    cached: &CachedTlsData,
+    rng: &SecureRandom,
+    selected_key_share_group: u16,
+) -> Vec<u8> {
     let capacity = cached
         .server_hello_template
         .extensions
@@ -243,13 +273,14 @@ fn build_profiled_server_hello_extensions(cached: &CachedTlsData, rng: &SecureRa
             ext,
             &mut extensions,
             rng,
+            selected_key_share_group,
             &mut saw_supported_versions,
             &mut saw_key_share,
         );
     }
 
     if !saw_key_share {
-        push_key_share_extension(&mut extensions, rng);
+        push_key_share_extension(&mut extensions, rng, selected_key_share_group);
     }
     if !saw_supported_versions {
         push_supported_versions_extension(&mut extensions);
@@ -268,12 +299,13 @@ pub fn build_emulated_server_hello(
     serverhello_compact: bool,
     client_tls_version: ClientHelloTlsVersion,
     selected_cipher_suite: [u8; 2],
+    selected_key_share_group: u16,
     rng: &SecureRandom,
     alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     // --- ServerHello ---
-    let extensions = build_profiled_server_hello_extensions(cached, rng);
+    let extensions = build_profiled_server_hello_extensions(cached, rng, selected_key_share_group);
     let extensions_len = extensions.len() as u16;
 
     let body_len = 2 + 32 + 1 + session_id.len() + 2 + 1 + 2 + extensions.len();
@@ -458,7 +490,7 @@ mod tests {
     use crate::protocol::constants::{
         TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
     };
-    use crate::protocol::tls::ClientHelloTlsVersion;
+    use crate::protocol::tls::{ClientHelloTlsVersion, TLS_NAMED_GROUP_X25519MLKEM768};
 
     fn first_app_data_payload(response: &[u8]) -> &[u8] {
         let hello_len = u16::from_be_bytes([response[3], response[4]]) as usize;
@@ -540,6 +572,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls12,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,
@@ -569,6 +602,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls13,
             [0x13, 0x03],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,
@@ -604,6 +638,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls13,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             Some(b"h2".to_vec()),
             0,
@@ -628,6 +663,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls12,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,
@@ -663,6 +699,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls12,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,
@@ -704,6 +741,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls13,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,
@@ -737,6 +775,7 @@ mod tests {
             false,
             ClientHelloTlsVersion::Tls12,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             Some(b"h2".to_vec()),
             0,
@@ -769,6 +808,7 @@ mod tests {
             true,
             ClientHelloTlsVersion::Tls13,
             [0x13, 0x01],
+            TLS_NAMED_GROUP_X25519MLKEM768,
             &rng,
             None,
             0,

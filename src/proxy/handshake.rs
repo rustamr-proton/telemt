@@ -1502,6 +1502,7 @@ where
     replay_checker.add_tls_digest(digest_half);
 
     let validation_session_id_slice = &validation_session_id[..validation_session_id_len];
+    let selected_key_share_group = tls::select_server_hello_key_share_group(handshake);
 
     let response = if let Some((cached_entry, use_full_cert_payload)) = cached {
         let preferred_cipher_suite = if cached_entry.server_hello_template.cipher_suite == [0, 0] {
@@ -1520,6 +1521,7 @@ where
             config.censorship.serverhello_compact,
             client_tls_version,
             selected_cipher_suite,
+            selected_key_share_group,
             rng,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
@@ -1533,6 +1535,7 @@ where
             config.censorship.fake_cert_len,
             rng,
             selected_cipher_suite,
+            selected_key_share_group,
             selected_alpn.clone(),
             config.censorship.tls_new_session_tickets,
         )

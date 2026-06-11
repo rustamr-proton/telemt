@@ -4,7 +4,7 @@ use crate::crypto::SecureRandom;
 use crate::protocol::constants::{
     TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
 };
-use crate::protocol::tls::ClientHelloTlsVersion;
+use crate::protocol::tls::{ClientHelloTlsVersion, TLS_NAMED_GROUP_X25519MLKEM768};
 use crate::tls_front::emulator::build_emulated_server_hello;
 use crate::tls_front::types::{
     CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsProfileSource,
@@ -59,6 +59,7 @@ fn emulated_server_hello_ignores_oversized_alpn_when_marker_would_not_fit() {
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         Some(oversized_alpn),
         0,
@@ -98,6 +99,7 @@ fn emulated_server_hello_keeps_alpn_marker_out_of_appdata() {
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         Some(b"h2".to_vec()),
         0,
@@ -129,6 +131,7 @@ fn emulated_server_hello_prefers_cert_payload_over_alpn_marker() {
         true,
         ClientHelloTlsVersion::Tls12,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         Some(b"h2".to_vec()),
         0,

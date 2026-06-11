@@ -1240,6 +1240,18 @@ fn test_gen_fake_x25519_key() {
 }
 
 #[test]
+fn test_gen_fake_x25519mlkem768_server_key_share_shape() {
+    let rng = crate::crypto::SecureRandom::new();
+    let key_share = gen_fake_x25519mlkem768_server_key_share(&rng);
+
+    assert_eq!(key_share.len(), X25519MLKEM768_SERVER_KEY_SHARE_LEN);
+    assert!(
+        key_share.iter().any(|byte| *byte != 0),
+        "hybrid ServerHello key_share must not collapse to all-zero bytes"
+    );
+}
+
+#[test]
 fn test_fake_x25519_key_is_nonzero_and_varies() {
     let rng = crate::crypto::SecureRandom::new();
     let mut unique = std::collections::HashSet::new();
@@ -1325,6 +1337,65 @@ fn server_hello_extension_types(record: &[u8]) -> Vec<u16> {
     out
 }
 
+fn server_hello_key_share(record: &[u8]) -> Option<(u16, usize)> {
+    if record.len() < 9 || record[0] != TLS_RECORD_HANDSHAKE || record[5] != 0x02 {
+        return None;
+    }
+
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    if record.len() < 5 + record_len {
+        return None;
+    }
+
+    let hs_len = u32::from_be_bytes([0, record[6], record[7], record[8]]) as usize;
+    let hs_start = 5;
+    let hs_end = hs_start + 4 + hs_len;
+    if hs_end > record.len() {
+        return None;
+    }
+
+    let mut pos = hs_start + 4 + 2 + 32;
+    if pos >= hs_end {
+        return None;
+    }
+    let sid_len = record[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 + 1 + 2 > hs_end {
+        return None;
+    }
+
+    pos += 2 + 1;
+    let ext_len = u16::from_be_bytes([record[pos], record[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_len;
+    if ext_end > hs_end {
+        return None;
+    }
+
+    while pos + 4 <= ext_end {
+        let etype = u16::from_be_bytes([record[pos], record[pos + 1]]);
+        let elen = u16::from_be_bytes([record[pos + 2], record[pos + 3]]) as usize;
+        pos += 4;
+        if pos + elen > ext_end {
+            return None;
+        }
+        if etype == extension_type::KEY_SHARE {
+            if elen < 4 {
+                return None;
+            }
+            let group = u16::from_be_bytes([record[pos], record[pos + 1]]);
+            let key_exchange_len = u16::from_be_bytes([record[pos + 2], record[pos + 3]]) as usize;
+            if 4 + key_exchange_len != elen {
+                return None;
+            }
+            return Some((group, key_exchange_len));
+        }
+        pos += elen;
+    }
+
+    None
+}
+
 #[test]
 fn build_server_hello_never_places_alpn_in_server_hello_extensions() {
     let secret = b"alpn_sh_forbidden";
@@ -1386,6 +1457,7 @@ fn emulated_server_hello_never_places_alpn_in_server_hello_extensions() {
         true,
         ClientHelloTlsVersion::Tls13,
         [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519MLKEM768,
         &rng,
         Some(b"h2".to_vec()),
         0,
@@ -1402,7 +1474,7 @@ fn test_tls_extension_builder() {
     let key = [0x42u8; 32];
 
     let mut builder = TlsExtensionBuilder::new();
-    builder.add_key_share(&key);
+    builder.add_key_share(TLS_NAMED_GROUP_X25519, &key);
     builder.add_supported_versions(0x0304);
 
     let result = builder.build();
@@ -1418,7 +1490,7 @@ fn test_server_hello_builder() {
     let key = [0x55u8; 32];
 
     let builder = ServerHelloBuilder::new(session_id.clone())
-        .with_x25519_key(&key)
+        .with_key_share(TLS_NAMED_GROUP_X25519, &key)
         .with_tls13_version();
 
     let record = builder.build_record();
@@ -1452,6 +1524,39 @@ fn test_build_server_hello_structure() {
     let app_start = ccs_start + ccs_len;
     assert!(response.len() > app_start + 5);
     assert_eq!(response[app_start], TLS_RECORD_APPLICATION);
+
+    assert_eq!(
+        server_hello_key_share(&response),
+        Some((
+            TLS_NAMED_GROUP_X25519MLKEM768,
+            X25519MLKEM768_SERVER_KEY_SHARE_LEN
+        ))
+    );
+}
+
+#[test]
+fn test_build_server_hello_with_cipher_can_keep_x25519_key_share() {
+    let secret = b"test secret";
+    let client_digest = [0x42u8; 32];
+    let session_id = vec![0xAA; 32];
+
+    let rng = crate::crypto::SecureRandom::new();
+    let response = build_server_hello_with_cipher(
+        secret,
+        &client_digest,
+        &session_id,
+        2048,
+        &rng,
+        [0x13, 0x01],
+        TLS_NAMED_GROUP_X25519,
+        None,
+        0,
+    );
+
+    assert_eq!(
+        server_hello_key_share(&response),
+        Some((TLS_NAMED_GROUP_X25519, X25519_KEY_SHARE_LEN))
+    );
 }
 
 #[test]
@@ -1477,7 +1582,7 @@ fn test_server_hello_extensions_length() {
     let key = [0x55u8; 32];
 
     let builder = ServerHelloBuilder::new(session_id)
-        .with_x25519_key(&key)
+        .with_key_share(TLS_NAMED_GROUP_X25519, &key)
         .with_tls13_version();
 
     let record = builder.build_record();
@@ -1511,6 +1616,23 @@ fn test_validate_tls_handshake_format() {
 
 fn build_client_hello_with_exts(exts: Vec<(u16, Vec<u8>)>, host: &str) -> Vec<u8> {
     build_client_hello_with_ciphers_and_exts(&[[0x13, 0x01]], exts, host)
+}
+
+fn client_key_share_extension(entries: &[(u16, usize)]) -> Vec<u8> {
+    let mut shares = Vec::new();
+    for (group, key_exchange_len) in entries {
+        assert!(*key_exchange_len <= u16::MAX as usize);
+        shares.extend_from_slice(&group.to_be_bytes());
+        shares.extend_from_slice(&(*key_exchange_len as u16).to_be_bytes());
+        let start = shares.len();
+        shares.resize(start + *key_exchange_len, 0x42);
+    }
+
+    assert!(shares.len() <= u16::MAX as usize);
+    let mut extension = Vec::new();
+    extension.extend_from_slice(&(shares.len() as u16).to_be_bytes());
+    extension.extend_from_slice(&shares);
+    extension
 }
 
 fn build_client_hello_with_ciphers_and_exts(
@@ -1708,6 +1830,67 @@ fn select_server_hello_cipher_suite_keeps_preferred_for_malformed_clienthello() 
     assert_eq!(
         select_server_hello_cipher_suite(&ch, [0x13, 0x01]),
         [0x13, 0x01]
+    );
+}
+
+#[test]
+fn select_server_hello_key_share_group_prefers_hybrid_when_valid_share_is_offered() {
+    let key_share = client_key_share_extension(&[
+        (0x0a0a, 1),
+        (
+            TLS_NAMED_GROUP_X25519MLKEM768,
+            X25519MLKEM768_CLIENT_KEY_SHARE_LEN,
+        ),
+        (TLS_NAMED_GROUP_X25519, X25519_KEY_SHARE_LEN),
+    ]);
+    let ch = build_client_hello_with_exts(vec![(0x0033, key_share)], "example.com");
+
+    assert_eq!(
+        select_server_hello_key_share_group(&ch),
+        TLS_NAMED_GROUP_X25519MLKEM768
+    );
+}
+
+#[test]
+fn select_server_hello_key_share_group_falls_back_without_hybrid_share() {
+    let key_share =
+        client_key_share_extension(&[(TLS_NAMED_GROUP_X25519, X25519_KEY_SHARE_LEN)]);
+    let ch = build_client_hello_with_exts(vec![(0x0033, key_share)], "example.com");
+
+    assert_eq!(
+        select_server_hello_key_share_group(&ch),
+        TLS_NAMED_GROUP_X25519
+    );
+}
+
+#[test]
+fn select_server_hello_key_share_group_falls_back_for_malformed_hybrid_len() {
+    let key_share = client_key_share_extension(&[(
+        TLS_NAMED_GROUP_X25519MLKEM768,
+        X25519MLKEM768_CLIENT_KEY_SHARE_LEN - 1,
+    )]);
+    let ch = build_client_hello_with_exts(vec![(0x0033, key_share)], "example.com");
+
+    assert_eq!(
+        select_server_hello_key_share_group(&ch),
+        TLS_NAMED_GROUP_X25519
+    );
+}
+
+#[test]
+fn select_server_hello_key_share_group_falls_back_for_malformed_key_share_tail() {
+    let mut key_share = client_key_share_extension(&[(
+        TLS_NAMED_GROUP_X25519MLKEM768,
+        X25519MLKEM768_CLIENT_KEY_SHARE_LEN,
+    )]);
+    let shares_len = u16::from_be_bytes([key_share[0], key_share[1]]) + 1;
+    key_share[0..2].copy_from_slice(&shares_len.to_be_bytes());
+    key_share.push(0);
+    let ch = build_client_hello_with_exts(vec![(0x0033, key_share)], "example.com");
+
+    assert_eq!(
+        select_server_hello_key_share_group(&ch),
+        TLS_NAMED_GROUP_X25519
     );
 }
 
