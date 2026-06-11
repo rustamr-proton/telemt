@@ -45,9 +45,16 @@ fn make_valid_tls_handshake(secret: &[u8], timestamp: u32) -> Vec<u8> {
     extensions.extend_from_slice(&(key_share_extension.len() as u16).to_be_bytes());
     extensions.extend_from_slice(&key_share_extension);
 
-    let body_len =
-        2 + 32 + 1 + session_id_len + 2 + TLS_AES_128_GCM_SHA256.len() + 1 + 1 + 2
-            + extensions.len();
+    let body_len = 2
+        + 32
+        + 1
+        + session_id_len
+        + 2
+        + TLS_AES_128_GCM_SHA256.len()
+        + 1
+        + 1
+        + 2
+        + extensions.len();
     let mut body = Vec::with_capacity(body_len);
     body.extend_from_slice(&TLS_VERSION);
     body.extend_from_slice(&[fill; 32]);
