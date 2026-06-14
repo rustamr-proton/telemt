@@ -1,19 +1,22 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::{ProxyError, Result};
-use crate::network::probe::is_bogon;
-use crate::network::stun::{IpFamily, stun_probe_dual, stun_probe_family_with_bind};
+use crate::network::probe::{detect_public_ipv4_http, is_bogon};
+use crate::network::stun::{
+    IpFamily, stun_probe_dual_with_tcp_fallback, stun_probe_family_with_bind_and_tcp_fallback,
+};
 
 use super::MePool;
 use std::time::Instant;
 
 const STUN_BATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const STUN_BATCH_TCP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[allow(dead_code)]
 pub async fn stun_probe(stun_addr: Option<String>) -> Result<crate::network::stun::DualStunResult> {
@@ -28,15 +31,14 @@ pub async fn stun_probe(stun_addr: Option<String>) -> Result<crate::network::stu
             "STUN server is not configured".to_string(),
         ));
     }
-    stun_probe_dual(&stun_addr).await
+    stun_probe_dual_with_tcp_fallback(&stun_addr, false).await
 }
 
 #[allow(dead_code)]
 pub async fn detect_public_ip() -> Option<IpAddr> {
-    fetch_public_ipv4_with_retry()
+    let urls = crate::config::defaults::default_http_ip_detect_urls();
+    detect_public_ipv4_http(&urls)
         .await
-        .ok()
-        .flatten()
         .map(IpAddr::V4)
 }
 
@@ -65,15 +67,26 @@ impl MePool {
         let mut live_servers = Vec::new();
         let mut best_by_ip: HashMap<IpAddr, (usize, std::net::SocketAddr)> = HashMap::new();
         let concurrency = self.nat_runtime.nat_probe_concurrency.max(1);
+        let tcp_fallback = self.nat_runtime.stun_tcp_fallback;
 
         while next_idx < servers.len() || !join_set.is_empty() {
             while next_idx < servers.len() && join_set.len() < concurrency {
                 let stun_addr = servers[next_idx].clone();
                 next_idx += 1;
                 join_set.spawn(async move {
+                    let batch_timeout = if tcp_fallback {
+                        STUN_BATCH_TCP_FALLBACK_TIMEOUT
+                    } else {
+                        STUN_BATCH_TIMEOUT
+                    };
                     let res = timeout(
-                        STUN_BATCH_TIMEOUT,
-                        stun_probe_family_with_bind(&stun_addr, family, bind_ip),
+                        batch_timeout,
+                        stun_probe_family_with_bind_and_tcp_fallback(
+                            &stun_addr,
+                            family,
+                            bind_ip,
+                            tcp_fallback,
+                        ),
                     )
                     .await;
                     (stun_addr, res)
@@ -193,6 +206,10 @@ impl MePool {
             return self.nat_runtime.nat_ip_cfg;
         }
 
+        if !self.nat_runtime.nat_probe {
+            return None;
+        }
+
         if !(is_bogon(local_ip) || local_ip.is_loopback() || local_ip.is_unspecified()) {
             return None;
         }
@@ -201,21 +218,15 @@ impl MePool {
             return Some(ip);
         }
 
-        match fetch_public_ipv4_with_retry().await {
-            Ok(Some(ip)) => {
-                {
-                    let mut guard = self.nat_runtime.nat_ip_detected.write().await;
-                    *guard = Some(IpAddr::V4(ip));
-                }
-                info!(public_ip = %ip, "Auto-detected public IP for NAT translation");
-                Some(IpAddr::V4(ip))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, "Failed to auto-detect public IP");
-                None
-            }
+        let Some(ip) = detect_public_ipv4_http(&self.nat_runtime.http_ip_detect_urls).await else {
+            return None;
+        };
+        {
+            let mut guard = self.nat_runtime.nat_ip_detected.write().await;
+            *guard = Some(IpAddr::V4(ip));
         }
+        info!(public_ip = %ip, "Auto-detected public IP for NAT translation");
+        Some(IpAddr::V4(ip))
     }
 
     pub(super) async fn maybe_reflect_public_addr(
@@ -364,32 +375,4 @@ impl MePool {
         }
         None
     }
-}
-
-async fn fetch_public_ipv4_with_retry() -> Result<Option<Ipv4Addr>> {
-    let providers = [
-        "https://checkip.amazonaws.com",
-        "http://v4.ident.me",
-        "http://ipv4.icanhazip.com",
-    ];
-    for url in providers {
-        if let Ok(Some(ip)) = fetch_public_ipv4_once(url).await {
-            return Ok(Some(ip));
-        }
-    }
-    Ok(None)
-}
-
-async fn fetch_public_ipv4_once(url: &str) -> Result<Option<Ipv4Addr>> {
-    let res = reqwest::get(url)
-        .await
-        .map_err(|e| ProxyError::Proxy(format!("public IP detection request failed: {e}")))?;
-
-    let text = res
-        .text()
-        .await
-        .map_err(|e| ProxyError::Proxy(format!("public IP detection read failed: {e}")))?;
-
-    let ip = text.trim().parse().ok();
-    Ok(ip)
 }

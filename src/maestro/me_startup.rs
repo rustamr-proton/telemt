@@ -208,6 +208,8 @@ pub(crate) async fn initialize_me_pool(
                     me_nat_probe,
                     None,
                     config.network.stun_servers.clone(),
+                    config.network.stun_tcp_fallback,
+                    config.network.http_ip_detect_urls.clone(),
                     config.general.stun_nat_probe_concurrency,
                     probe.detected_ipv6,
                     config.timeouts.me_one_retry,

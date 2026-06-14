@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::{NetworkConfig, UpstreamConfig, UpstreamType};
 use crate::error::Result;
 use crate::network::stun::{
-    DualStunResult, IpFamily, StunProbeResult, stun_probe_family_with_bind,
+    DualStunResult, IpFamily, StunProbeResult, stun_probe_family_with_bind_and_tcp_fallback,
 };
 use crate::transport::UpstreamManager;
 
@@ -58,6 +58,7 @@ impl NetworkDecision {
 }
 
 const STUN_BATCH_TIMEOUT: Duration = Duration::from_secs(5);
+const STUN_BATCH_TCP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub async fn run_probe(
     config: &NetworkConfig,
@@ -81,8 +82,14 @@ pub async fn run_probe(
             warn!("STUN probe is enabled but network.stun_servers is empty");
             DualStunResult::default()
         } else {
-            probe_stun_servers_parallel(&servers, stun_nat_probe_concurrency.max(1), None, None)
-                .await
+            probe_stun_servers_parallel(
+                &servers,
+                stun_nat_probe_concurrency.max(1),
+                None,
+                None,
+                config.stun_tcp_fallback,
+            )
+            .await
         }
     } else if nat_probe {
         info!("STUN probe is disabled by network.stun_use=false");
@@ -163,6 +170,7 @@ pub async fn run_probe(
             stun_nat_probe_concurrency.max(1),
             bind_v4,
             bind_v6,
+            config.stun_tcp_fallback,
         )
         .await;
         if let Some(reflected) = direct_stun_res.v4.map(|r| r.reflected_addr) {
@@ -234,7 +242,7 @@ pub async fn run_probe(
     Ok(probe)
 }
 
-async fn detect_public_ipv4_http(urls: &[String]) -> Option<Ipv4Addr> {
+pub(crate) async fn detect_public_ipv4_http(urls: &[String]) -> Option<Ipv4Addr> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -277,6 +285,7 @@ async fn probe_stun_servers_parallel(
     concurrency: usize,
     bind_v4: Option<IpAddr>,
     bind_v6: Option<IpAddr>,
+    tcp_fallback: bool,
 ) -> DualStunResult {
     let mut join_set = JoinSet::new();
     let mut next_idx = 0usize;
@@ -288,9 +297,26 @@ async fn probe_stun_servers_parallel(
             let stun_addr = servers[next_idx].clone();
             next_idx += 1;
             join_set.spawn(async move {
-                let res = timeout(STUN_BATCH_TIMEOUT, async {
-                    let v4 = stun_probe_family_with_bind(&stun_addr, IpFamily::V4, bind_v4).await?;
-                    let v6 = stun_probe_family_with_bind(&stun_addr, IpFamily::V6, bind_v6).await?;
+                let batch_timeout = if tcp_fallback {
+                    STUN_BATCH_TCP_FALLBACK_TIMEOUT
+                } else {
+                    STUN_BATCH_TIMEOUT
+                };
+                let res = timeout(batch_timeout, async {
+                    let v4 = stun_probe_family_with_bind_and_tcp_fallback(
+                        &stun_addr,
+                        IpFamily::V4,
+                        bind_v4,
+                        tcp_fallback,
+                    )
+                    .await?;
+                    let v6 = stun_probe_family_with_bind_and_tcp_fallback(
+                        &stun_addr,
+                        IpFamily::V6,
+                        bind_v6,
+                        tcp_fallback,
+                    )
+                    .await?;
                     Ok::<DualStunResult, crate::error::ProxyError>(DualStunResult { v4, v6 })
                 })
                 .await;

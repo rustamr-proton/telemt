@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::MeSocksKdfPolicy;
-use crate::crypto::{SecureRandom, build_middleproxy_prekey, derive_middleproxy_keys, sha256};
+use crate::crypto::{SecureRandom, derive_middleproxy_keys};
 use crate::error::{ProxyError, Result};
 use crate::network::IpFamily;
 use crate::network::probe::is_bogon;
@@ -292,14 +292,15 @@ impl MePool {
             BndPortStatus::Error
         };
         record_bnd_status(bnd_addr_status, bnd_port_status, raw_socks_bound_addr);
-        let reflected = if let Some(bound) = socks_bound_addr {
+        let socks_bound_kdf_addr = socks_bound_addr.filter(|bound| bound.port() != 0);
+        let reflected = if let Some(bound) = socks_bound_kdf_addr {
             Some(bound)
         } else if is_socks_route {
             match self.socks_kdf_policy() {
                 MeSocksKdfPolicy::Strict => {
                     self.stats.increment_me_socks_kdf_strict_reject();
                     return Err(ProxyError::InvalidHandshake(
-                        "SOCKS route returned no valid BND.ADDR for ME KDF (strict policy)"
+                        "SOCKS route returned no valid BND tuple for ME KDF (strict policy)"
                             .to_string(),
                     ));
                 }
@@ -323,16 +324,14 @@ impl MePool {
         let local_addr_nat = self.translate_our_addr_with_reflection(local_addr, reflected);
         let peer_addr_nat =
             SocketAddr::new(self.translate_ip_for_nat(peer_addr.ip()), peer_addr.port());
+        let client_addr_for_kdf = socks_bound_kdf_addr.unwrap_or(local_addr_nat);
         if let Some(upstream_info) = upstream_egress {
-            let client_ip_for_kdf = socks_bound_addr
-                .map(|value| value.ip())
-                .unwrap_or(local_addr_nat.ip());
             record_upstream_bnd_status(
                 upstream_info.upstream_id,
                 bnd_addr_status,
                 bnd_port_status,
                 raw_socks_bound_addr,
-                Some(client_ip_for_kdf),
+                Some(client_addr_for_kdf.ip()),
             );
         }
         let (mut rd, mut wr) = tokio::io::split(stream);
@@ -409,6 +408,7 @@ impl MePool {
         info!(
             %local_addr,
             %local_addr_nat,
+            %client_addr_for_kdf,
             reflected_ip = reflected.map(|r| r.ip()).as_ref().map(ToString::to_string),
             %peer_addr,
             %transport_peer_addr,
@@ -422,16 +422,14 @@ impl MePool {
 
         let ts_bytes = crypto_ts.to_le_bytes();
         let server_port_bytes = peer_addr_nat.port().to_le_bytes();
-        let socks_bound_port = socks_bound_addr
-            .map(|bound| bound.port())
-            .filter(|port| *port != 0);
-        let client_port_for_kdf = socks_bound_port.unwrap_or(local_addr_nat.port());
+        let socks_bound_port = socks_bound_kdf_addr.map(|bound| bound.port());
+        let client_port_for_kdf = client_addr_for_kdf.port();
         let client_port_source = KdfClientPortSource::from_socks_bound_port(socks_bound_port);
         let kdf_fingerprint = Self::kdf_material_fingerprint(
-            local_addr_nat.ip(),
+            client_addr_for_kdf.ip(),
             peer_addr_nat,
             reflected.map(|value| value.ip()),
-            socks_bound_addr.map(|value| value.ip()),
+            socks_bound_kdf_addr.map(|value| value.ip()),
             client_port_source,
         );
         let previous_kdf_fingerprint = {
@@ -473,7 +471,7 @@ impl MePool {
         let client_port_bytes = client_port_for_kdf.to_le_bytes();
 
         let server_ip = extract_ip_material(peer_addr_nat);
-        let client_ip = extract_ip_material(local_addr_nat);
+        let client_ip = extract_ip_material(client_addr_for_kdf);
 
         let (srv_ip_opt, clt_ip_opt, clt_v6_opt, srv_v6_opt, hs_our_ip, hs_peer_ip) =
             match (server_ip, client_ip) {
@@ -493,38 +491,6 @@ impl MePool {
                     ));
                 }
             };
-
-        let diag_level: u8 = std::env::var("ME_DIAG")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let prekey_client = build_middleproxy_prekey(
-            &srv_nonce,
-            &my_nonce,
-            &ts_bytes,
-            srv_ip_opt.as_ref().map(|x| &x[..]),
-            &client_port_bytes,
-            b"CLIENT",
-            clt_ip_opt.as_ref().map(|x| &x[..]),
-            &server_port_bytes,
-            &secret,
-            clt_v6_opt.as_ref(),
-            srv_v6_opt.as_ref(),
-        );
-        let prekey_server = build_middleproxy_prekey(
-            &srv_nonce,
-            &my_nonce,
-            &ts_bytes,
-            srv_ip_opt.as_ref().map(|x| &x[..]),
-            &client_port_bytes,
-            b"SERVER",
-            clt_ip_opt.as_ref().map(|x| &x[..]),
-            &server_port_bytes,
-            &secret,
-            clt_v6_opt.as_ref(),
-            srv_v6_opt.as_ref(),
-        );
 
         let (wk, wi) = derive_middleproxy_keys(
             &srv_nonce,
@@ -556,47 +522,14 @@ impl MePool {
         let requested_crc_mode = RpcChecksumMode::Crc32c;
         let hs_payload = build_handshake_payload(
             hs_our_ip,
-            local_addr.port(),
+            client_port_for_kdf,
             hs_peer_ip,
-            peer_addr.port(),
+            peer_addr_nat.port(),
             requested_crc_mode.advertised_flags(),
         );
         let hs_frame = build_rpc_frame(-1, &hs_payload, RpcChecksumMode::Crc32);
-        if diag_level >= 1 {
-            info!(
-                write_key = %hex_dump(&wk),
-                write_iv = %hex_dump(&wi),
-                read_key = %hex_dump(&rk),
-                read_iv = %hex_dump(&ri),
-                srv_ip = %srv_ip_opt.map(|ip| hex_dump(&ip)).unwrap_or_default(),
-                clt_ip = %clt_ip_opt.map(|ip| hex_dump(&ip)).unwrap_or_default(),
-                srv_port = %hex_dump(&server_port_bytes),
-                clt_port = %hex_dump(&client_port_bytes),
-                crypto_ts = %hex_dump(&ts_bytes),
-                nonce_srv = %hex_dump(&srv_nonce),
-                nonce_clt = %hex_dump(&my_nonce),
-                prekey_sha256_client = %hex_dump(&sha256(&prekey_client)),
-                prekey_sha256_server = %hex_dump(&sha256(&prekey_server)),
-                hs_plain = %hex_dump(&hs_frame),
-                proxy_secret_sha256 = %hex_dump(&sha256(&secret)),
-                "ME diag: derived keys and handshake plaintext"
-            );
-        }
-        if diag_level >= 2 {
-            info!(
-                prekey_client = %hex_dump(&prekey_client),
-                prekey_server = %hex_dump(&prekey_server),
-                "ME diag: full prekey buffers"
-            );
-        }
 
         let (encrypted_hs, write_iv) = cbc_encrypt_padded(&wk, &wi, &hs_frame)?;
-        if diag_level >= 1 {
-            info!(
-                hs_cipher = %hex_dump(&encrypted_hs),
-                "ME diag: handshake ciphertext"
-            );
-        }
         wr.write_all(&encrypted_hs).await.map_err(ProxyError::Io)?;
         wr.flush().await.map_err(ProxyError::Io)?;
 

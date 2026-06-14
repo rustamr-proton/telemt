@@ -236,7 +236,8 @@ pub fn is_valid_secure_payload_len(data_len: usize) -> bool {
 }
 
 /// Compute Secure Intermediate payload length from wire length.
-/// Secure mode strips up to 3 random tail bytes by truncating to 4-byte boundary.
+/// Secure mode cannot distinguish full-word padding from payload, so only the
+/// non-aligned tail bytes are stripped.
 pub fn secure_payload_len_from_wire_len(wire_len: usize) -> Option<usize> {
     if wire_len < 4 {
         return None;
@@ -245,13 +246,13 @@ pub fn secure_payload_len_from_wire_len(wire_len: usize) -> Option<usize> {
 }
 
 /// Generate padding length for Secure Intermediate protocol.
-/// Data must be 4-byte aligned; padding is 1..=3 so total is never divisible by 4.
+/// Telegram Desktop uses a 4-bit random padding length for VersionD packets.
 pub fn secure_padding_len(data_len: usize, rng: &SecureRandom) -> usize {
     debug_assert!(
         is_valid_secure_payload_len(data_len),
         "Secure payload must be 4-byte aligned, got {data_len}"
     );
-    rng.range(3) + 1
+    rng.range(16)
 }
 
 // ============= Timeouts =============
@@ -424,20 +425,14 @@ mod tests {
     }
 
     #[test]
-    fn secure_padding_never_produces_aligned_total() {
+    fn secure_padding_matches_tdesktop_range() {
         let rng = SecureRandom::new();
         for data_len in (0..1000).step_by(4) {
             for _ in 0..100 {
                 let padding = secure_padding_len(data_len, &rng);
                 assert!(
-                    padding <= 3,
+                    padding <= 15,
                     "padding out of range: data_len={data_len}, padding={padding}"
-                );
-                assert_ne!(
-                    (data_len + padding) % 4,
-                    0,
-                    "invariant violated: data_len={data_len}, padding={padding}, total={}",
-                    data_len + padding
                 );
             }
         }
@@ -451,6 +446,16 @@ mod tests {
                 let recovered = secure_payload_len_from_wire_len(wire_len);
                 assert_eq!(recovered, Some(payload_len));
             }
+        }
+    }
+
+    #[test]
+    fn secure_wire_len_preserves_full_word_tail() {
+        let payload_len = 64;
+        for padding in [4usize, 8, 12] {
+            let wire_len = payload_len + padding;
+            let recovered = secure_payload_len_from_wire_len(wire_len);
+            assert_eq!(recovered, Some(wire_len));
         }
     }
 

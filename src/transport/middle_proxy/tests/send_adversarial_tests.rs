@@ -31,6 +31,8 @@ async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
         false,
         None,
         Vec::new(),
+        false,
+        Vec::new(),
         1,
         None,
         12,
