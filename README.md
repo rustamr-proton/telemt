@@ -8,7 +8,7 @@
 >
 > From June 5th, 2026: we are already analyzing the causes of a new wave of "malfunctions"
 > 
-> Telegram Clients TLS ClientHello has been banned by JA3 Fingerprint: we are already looking for ways to solve this problem
+> Telegram Clients TLS ClientHello has been banned by JA4/JA4+ Fingerprint: we are already looking for ways to solve this problem
 >
 > You can try build your client with our Telegram Devlibrary - [tdlib-obf](https://github.com/telemt/tdlib-obf)
 
