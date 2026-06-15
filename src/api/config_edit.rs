@@ -314,6 +314,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_rejects_show_link_section() {
+        // show_link is a legacy top-level scalar/array (not a [table]); it cannot
+        // be upserted safely and is superseded by the editable general.links.show.
+        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
+        let patch: Json = serde_json::json!({"show_link": "*"});
+        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
+        assert_eq!(err.code, "section_not_editable");
+    }
+
+    #[tokio::test]
+    async fn patch_general_links_show_is_editable() {
+        // The supported replacement path: edit show via the general.links sub-table.
+        let (path, _d) = temp_config(
+            "[general]\nprefer_ipv6 = false\n[general.links]\nshow = \"*\"\n\
+             [censorship]\ntls_domain = \"a\"\n",
+        );
+        let patch: Json = serde_json::json!({"general": {"links": {"show": ["alice"]}}});
+        let resp = apply_patch_to_path(&path, &patch, None).await.unwrap();
+        assert!(resp.changed.iter().any(|c| c == "general"));
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(
+            parsed["general"]["links"]["show"][0].as_str(),
+            Some("alice"),
+            "{written}"
+        );
+        // No leaked top-level [links]/[modes] and no duplicate sub-tables.
+        assert_eq!(written.matches("[general.links]").count(), 1, "{written}");
+    }
+
+    #[tokio::test]
+    async fn patch_links_public_port_written_as_integer_not_float_or_string() {
+        // A JSON integer must land on disk as a bare TOML integer (443), never
+        // 443.0 nor "443". The write re-renders from the typed config, so the
+        // u16 field dictates the output format regardless of JSON quirks.
+        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
+        let patch: Json = serde_json::json!({"general": {"links": {"public_port": 443}}});
+        apply_patch_to_path(&path, &patch, None).await.unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("public_port = 443"), "{written}");
+        assert!(
+            !written.contains("443.0"),
+            "must not be a float:\n{written}"
+        );
+        assert!(
+            !written.contains("\"443\""),
+            "must not be a string:\n{written}"
+        );
+
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(
+            parsed["general"]["links"]["public_port"].as_integer(),
+            Some(443),
+            "{written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_links_public_port_rejects_float() {
+        // 443.0 cannot deserialize into u16 -> rejected, not silently coerced.
+        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
+        let patch: Json = serde_json::json!({"general": {"links": {"public_port": 443.0}}});
+        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
+        assert_eq!(err.status, hyper::StatusCode::BAD_REQUEST, "{:?}", err);
+    }
+
+    #[tokio::test]
+    async fn patch_links_public_port_rejects_string() {
+        // "443" is a string, not a u16 -> rejected.
+        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
+        let patch: Json = serde_json::json!({"general": {"links": {"public_port": "443"}}});
+        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
+        assert_eq!(err.status, hyper::StatusCode::BAD_REQUEST, "{:?}", err);
+    }
+
+    #[tokio::test]
     async fn patch_empty_is_rejected() {
         let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
         let patch: Json = serde_json::json!({});

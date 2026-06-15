@@ -102,9 +102,14 @@ pub(super) async fn save_config_to_disk(
 /// Intentionally excluded (defense-in-depth, enforces the spec's per-node
 /// identity invariant at the Telemt layer too):
 ///
-///   - `access`  : owned by the users API.
-///   - `server`  : carries per-node identity (`port`, `api`/`api_bind`, listeners).
-///   - `network` : carries per-node identity (`ipv4`/`ipv6`).
+///   - `access`    : owned by the users API.
+///   - `server`    : carries per-node identity (`port`, `api`/`api_bind`, listeners).
+///   - `network`   : carries per-node identity (`ipv4`/`ipv6`).
+///   - `show_link` : legacy top-level scalar/array (not a `[table]`), superseded
+///                   by the editable `general.links.show` sub-table. The
+///                   section-upsert machinery here only handles `[table]` /
+///                   `[[array-of-tables]]` blocks; a bare top-level key cannot be
+///                   located or replaced safely, so it is edited via `general`.
 ///
 /// A future field-level allowlist can re-admit specific safe fields
 /// (e.g. `network.dns_overrides`) without opening the whole section.
@@ -113,7 +118,6 @@ pub(super) const EDITABLE_SECTIONS: &[&str] = &[
     "timeouts",
     "censorship",
     "upstreams",
-    "show_link",
     "dc_overrides",
 ];
 
@@ -162,10 +166,15 @@ fn render_top_level_section(cfg: &ProxyConfig, section: &str) -> Result<String, 
         return Ok(out);
     }
 
-    let body = toml::to_string(table)
+    // Serialize the table *inside a wrapper keyed by `section`* so the `toml`
+    // crate emits correctly dotted headers for nested sub-tables, e.g.
+    // `[general]` + `[general.modes]` + `[general.links]`. Serializing the
+    // inner table alone would render bare `[modes]`/`[links]` headers, which
+    // would leak as duplicate top-level tables and break config load.
+    let mut wrapper = toml::value::Table::new();
+    wrapper.insert(section.to_string(), table.clone());
+    let mut out = toml::to_string(&toml::Value::Table(wrapper))
         .map_err(|e| ApiFailure::internal(format!("failed to serialize {}: {}", section, e)))?;
-    let mut out = format!("[{}]\n", section);
-    out.push_str(&body);
     if !out.ends_with('\n') {
         out.push('\n');
     }
@@ -328,11 +337,22 @@ fn serialize_toml_key(key: &str) -> Result<String, ApiFailure> {
 }
 
 fn upsert_toml_table(source: &str, table_name: &str, replacement: &str) -> String {
-    if let Some((start, end)) = find_toml_table_bounds(source, table_name) {
+    let blocks = find_all_table_blocks(source, table_name);
+    if let Some(&(first_start, first_end)) = blocks.first() {
+        // Replace the first block in place and delete any further blocks that
+        // also belong to this table. Telemt writes a section's sub-tables
+        // contiguously, but a hand-edited config may scatter them; dropping the
+        // extras here prevents the duplicate-table corruption that would
+        // otherwise break config load.
         let mut out = String::with_capacity(source.len() + replacement.len());
-        out.push_str(&source[..start]);
+        out.push_str(&source[..first_start]);
         out.push_str(replacement);
-        out.push_str(&source[end..]);
+        let mut cursor = first_end;
+        for &(start, end) in &blocks[1..] {
+            out.push_str(&source[cursor..start]);
+            cursor = end;
+        }
+        out.push_str(&source[cursor..]);
         return out;
     }
 
@@ -347,29 +367,62 @@ fn upsert_toml_table(source: &str, table_name: &str, replacement: &str) -> Strin
     out
 }
 
+/// Whether a (comment-stripped, trimmed) TOML header line belongs to
+/// `table_name`: the table itself (`[X]` / `[[X]]`) or any of its nested
+/// sub-tables (`[X.…]` / `[[X.…]]`). The trailing dot guards against sibling
+/// prefixes — `access.users` must not match `access.user_enabled`.
+fn header_belongs_to(header: &str, table_name: &str) -> bool {
+    let body = match header.strip_prefix("[[").and_then(|h| h.strip_suffix("]]")) {
+        Some(body) => body,
+        None => match header.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            Some(body) => body,
+            None => return false,
+        },
+    };
+    let body = body.trim();
+    body == table_name
+        || body
+            .strip_prefix(table_name)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Locate the first contiguous byte range covering `table_name` and the nested
+/// sub-tables immediately following it. Used for existence checks; see
+/// [`find_all_table_blocks`] for the full set of (possibly scattered) blocks.
 fn find_toml_table_bounds(source: &str, table_name: &str) -> Option<(usize, usize)> {
-    let single = format!("[{}]", table_name);
-    let array = format!("[[{}]]", table_name);
+    find_all_table_blocks(source, table_name).into_iter().next()
+}
+
+/// Locate every byte range that belongs to `table_name`: the table header and
+/// its nested sub-tables. Returns one range per contiguous run, so a config
+/// where a section's sub-tables are scattered (e.g. hand-edited) yields several
+/// ranges — letting the caller collapse them into a single rendered block.
+fn find_all_table_blocks(source: &str, table_name: &str) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::new();
     let mut offset = 0usize;
-    let mut start = None;
+    let mut start: Option<usize> = None;
 
     for line in source.split_inclusive('\n') {
         // Drop any inline comment so a hand-edited header like
         // `[censorship] # note` still matches. Section names never contain `#`.
         let header = line.trim().split('#').next().unwrap_or("").trim();
+        let is_header = header.starts_with('[');
         if let Some(start_offset) = start {
-            let is_same_array = header == array;
-            let is_new_header = header.starts_with('[');
-            if is_new_header && !is_same_array {
-                return Some((start_offset, offset));
+            if is_header && !header_belongs_to(header, table_name) {
+                blocks.push((start_offset, offset));
+                start = None;
             }
-        } else if header == single || header == array {
+        }
+        if start.is_none() && header_belongs_to(header, table_name) {
             start = Some(offset);
         }
         offset = offset.saturating_add(line.len());
     }
 
-    start.map(|start_offset| (start_offset, source.len()))
+    if let Some(start_offset) = start {
+        blocks.push((start_offset, source.len()));
+    }
+    blocks
 }
 
 async fn write_atomic(path: PathBuf, contents: String) -> Result<(), ApiFailure> {
@@ -465,6 +518,138 @@ mod tests {
         assert!(slice.starts_with("[censorship] # notes"));
         assert!(slice.contains("tls_domain"));
         assert!(!slice.contains("[server]")); // terminates at the next header
+    }
+
+    #[tokio::test]
+    async fn save_general_section_keeps_subtables_dotted_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
+            &path,
+            "[general]\nprefer_ipv6 = false\n\n[general.modes]\ntls = true\n\n\
+             [general.links]\npublic_host = \"old.example\"\n\n[server]\nport = 443\n",
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = ProxyConfig::default();
+        cfg.general.prefer_ipv6 = true;
+
+        save_sections_to_disk(&path, &cfg, &["general"])
+            .await
+            .unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+
+        // No bare top-level [modes] / [links] headers leaked.
+        for line in written.lines() {
+            let header = line.trim();
+            assert_ne!(header, "[modes]", "leaked top-level [modes]:\n{written}");
+            assert_ne!(header, "[links]", "leaked top-level [links]:\n{written}");
+        }
+
+        // Sub-tables kept their dotted prefix exactly once each.
+        assert_eq!(
+            written.matches("[general.modes]").count(),
+            1,
+            "[general.modes] must appear exactly once:\n{written}"
+        );
+        assert_eq!(
+            written.matches("[general.links]").count(),
+            1,
+            "[general.links] must appear exactly once:\n{written}"
+        );
+
+        // Result parses (duplicate tables would error here).
+        toml::from_str::<toml::Value>(&written)
+            .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
+
+        assert!(written.contains("[server]\nport = 443")); // untouched table kept
+    }
+
+    #[tokio::test]
+    async fn save_general_section_is_idempotent_across_repeated_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        tokio::fs::write(
+            &path,
+            "[general]\nprefer_ipv6 = false\n\n[general.modes]\ntls = true\n\n\
+             [general.links]\npublic_host = \"old.example\"\n",
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = ProxyConfig::default();
+        cfg.general.prefer_ipv6 = true;
+
+        save_sections_to_disk(&path, &cfg, &["general"])
+            .await
+            .unwrap();
+        save_sections_to_disk(&path, &cfg, &["general"])
+            .await
+            .unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(written.matches("[general.modes]").count(), 1, "{written}");
+        assert_eq!(written.matches("[general.links]").count(), 1, "{written}");
+        assert_eq!(written.matches("[general]").count(), 1, "{written}");
+        toml::from_str::<toml::Value>(&written)
+            .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
+    }
+
+    #[test]
+    fn find_bounds_spans_dotted_subtables() {
+        let src = "[general]\nprefer_ipv6 = false\n\n[general.modes]\ntls = true\n\n\
+                   [general.links]\npublic_host = \"a\"\n\n[server]\nport = 1\n";
+        let bounds = find_toml_table_bounds(src, "general");
+        assert!(bounds.is_some(), "should locate [general] block");
+        let (start, end) = bounds.unwrap();
+        let slice = &src[start..end];
+        assert!(slice.starts_with("[general]"));
+        assert!(slice.contains("[general.modes]")); // spans nested sub-tables
+        assert!(slice.contains("[general.links]"));
+        assert!(!slice.contains("[server]")); // terminates at the next unrelated header
+    }
+
+    #[test]
+    fn find_bounds_does_not_overrun_sibling_prefix() {
+        // access.users must not swallow access.user_enabled (dot guards the prefix).
+        let src = "[access.users]\nalice = \"x\"\n\n[access.user_enabled]\nalice = true\n";
+        let bounds = find_toml_table_bounds(src, "access.users").unwrap();
+        let slice = &src[bounds.0..bounds.1];
+        assert!(slice.starts_with("[access.users]"));
+        assert!(!slice.contains("[access.user_enabled]"));
+    }
+
+    #[tokio::test]
+    async fn save_general_handles_non_contiguous_subtables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Hand-edited layout: [general.modes] sits AFTER an unrelated [server].
+        tokio::fs::write(
+            &path,
+            "[general]\nprefer_ipv6 = false\n\n[server]\nport = 443\n\n\
+             [general.modes]\ntls = true\n",
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = ProxyConfig::default();
+        cfg.general.prefer_ipv6 = true;
+
+        save_sections_to_disk(&path, &cfg, &["general"])
+            .await
+            .unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            written.matches("[general.modes]").count(),
+            1,
+            "non-contiguous [general.modes] must not duplicate:\n{written}"
+        );
+        toml::from_str::<toml::Value>(&written)
+            .unwrap_or_else(|e| panic!("written config must parse: {e}\n{written}"));
+        assert!(written.contains("[server]")); // unrelated section preserved
     }
 
     #[test]
