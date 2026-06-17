@@ -17,8 +17,8 @@ async fn tdd_repeated_local_listener_checks_do_not_repeat_interface_enumeration_
 
     let local_addr: SocketAddr = "0.0.0.0:443".parse().expect("valid local addr");
 
-    let _ = is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, None).await;
-    let _ = is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, None).await;
+    let _ = is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, &[]).await;
+    let _ = is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, &[]).await;
 
     assert_eq!(
         local_interface_enumerations_for_tests(),
@@ -35,7 +35,7 @@ async fn tdd_non_local_port_short_circuit_does_not_enumerate_interfaces() {
     reset_local_interface_enumerations_for_tests();
 
     let local_addr: SocketAddr = "0.0.0.0:443".parse().expect("valid local addr");
-    let is_local = is_mask_target_local_listener_async("127.0.0.1", 8443, local_addr, None).await;
+    let is_local = is_mask_target_local_listener_async("127.0.0.1", 8443, local_addr, &[]).await;
 
     assert!(
         !is_local,

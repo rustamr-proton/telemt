@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::proxy::handshake::{AuthProbeSaturationState, AuthProbeState};
@@ -14,6 +14,7 @@ use crate::proxy::middle_relay::{DesyncDedupRotationState, RelayIdleCandidateReg
 use crate::proxy::traffic_limiter::TrafficLimiter;
 
 const HANDSHAKE_RECENT_USER_RING_LEN: usize = 64;
+const MASKING_FALLBACK_MAX_CONCURRENT: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConntrackCloseReason {
@@ -72,6 +73,7 @@ pub(crate) struct ProxySharedState {
     active_user_sessions: DashMap<(String, u64), CancellationToken>,
     pub(crate) conntrack_pressure_active: AtomicBool,
     pub(crate) conntrack_close_tx: Mutex<Option<mpsc::Sender<ConntrackCloseEvent>>>,
+    masking_fallback_permits: Arc<Semaphore>,
 }
 
 #[must_use = "registered user sessions must be kept alive until relay completion"]
@@ -131,7 +133,16 @@ impl ProxySharedState {
             active_user_sessions: DashMap::new(),
             conntrack_pressure_active: AtomicBool::new(false),
             conntrack_close_tx: Mutex::new(None),
+            masking_fallback_permits: Arc::new(Semaphore::new(MASKING_FALLBACK_MAX_CONCURRENT)),
         })
+    }
+
+    /// Attempts to reserve one masking fallback slot for a pre-auth connection.
+    pub(crate) fn try_acquire_masking_fallback_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.masking_fallback_permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     pub(crate) fn is_user_enabled(&self, user: &str) -> bool {

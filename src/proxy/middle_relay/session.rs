@@ -491,12 +491,18 @@ where
                         d2c_flush_policy.max_bytes,
                         max_delay_fired,
                     );
-                    let flush_started_at = if stats_clone.telemetry_policy().me_level.allows_debug() {
+                    let physical_flush =
+                        me_d2c_flush_reason_requires_client_flush(flush_reason);
+                    let flush_started_at = if physical_flush
+                        && stats_clone.telemetry_policy().me_level.allows_debug()
+                    {
                         Some(Instant::now())
                     } else {
                         None
                     };
-                    flush_client_or_cancel(&mut writer, &flow_cancel_me_writer).await?;
+                    if physical_flush {
+                        flush_client_or_cancel(&mut writer, &flow_cancel_me_writer).await?;
+                    }
                     let flush_duration_us = flush_started_at.map(|started| {
                         started
                             .elapsed()

@@ -113,7 +113,7 @@ use crate::proxy::handshake::{
 };
 #[cfg(test)]
 use crate::proxy::handshake::{handle_mtproto_handshake, handle_tls_handshake};
-use crate::proxy::masking::handle_bad_client;
+use crate::proxy::masking::handle_bad_client_with_shared;
 use crate::proxy::middle_relay::handle_via_middle_proxy;
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
 use crate::proxy::shared_state::ProxySharedState;
@@ -310,6 +310,7 @@ fn masking_outcome<R, W>(
     local_addr: SocketAddr,
     config: Arc<ProxyConfig>,
     beobachten: Arc<BeobachtenStore>,
+    shared: Arc<ProxySharedState>,
 ) -> HandshakeOutcome
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -325,7 +326,7 @@ where
         )
         .await;
 
-        handle_bad_client(
+        handle_bad_client_with_shared(
             reader,
             writer,
             &initial_data,
@@ -333,6 +334,7 @@ where
             local_addr,
             &config,
             &beobachten,
+            shared.as_ref(),
         )
         .await;
         Ok(())
@@ -718,6 +720,7 @@ where
                     local_addr,
                     config.clone(),
                     beobachten.clone(),
+                    shared.clone(),
                 ));
             }
 
@@ -739,6 +742,7 @@ where
                         local_addr,
                         config.clone(),
                         beobachten.clone(),
+                        shared.clone(),
                     ));
                 }
             };
@@ -757,6 +761,7 @@ where
                     local_addr,
                     config.clone(),
                     beobachten.clone(),
+                    shared.clone(),
                 ));
             }
 
@@ -787,6 +792,7 @@ where
                         local_addr,
                         config.clone(),
                         beobachten.clone(),
+                        shared.clone(),
                     ));
                 }
                 HandshakeResult::Error(e) => {
@@ -844,6 +850,7 @@ where
                         local_addr,
                         config.clone(),
                         beobachten.clone(),
+                        shared.clone(),
                     ));
                 }
                 HandshakeResult::Error(e) => return Err(e),
@@ -873,6 +880,7 @@ where
                     local_addr,
                     config.clone(),
                     beobachten.clone(),
+                    shared.clone(),
                 ));
             }
 
@@ -898,6 +906,7 @@ where
                         local_addr,
                         config.clone(),
                         beobachten.clone(),
+                        shared.clone(),
                     ));
                 }
                 HandshakeResult::Error(e) => return Err(e),
@@ -1329,6 +1338,7 @@ impl RunningClientHandler {
                 local_addr,
                 self.config.clone(),
                 self.beobachten.clone(),
+                self.shared.clone(),
             ));
         }
 
@@ -1350,6 +1360,7 @@ impl RunningClientHandler {
                     local_addr,
                     self.config.clone(),
                     self.beobachten.clone(),
+                    self.shared.clone(),
                 ));
             }
         };
@@ -1369,6 +1380,7 @@ impl RunningClientHandler {
                 local_addr,
                 self.config.clone(),
                 self.beobachten.clone(),
+                self.shared.clone(),
             ));
         }
 
@@ -1416,6 +1428,7 @@ impl RunningClientHandler {
                     local_addr,
                     config.clone(),
                     self.beobachten.clone(),
+                    self.shared.clone(),
                 ));
             }
             HandshakeResult::Error(e) => {
@@ -1483,6 +1496,7 @@ impl RunningClientHandler {
                     local_addr,
                     config.clone(),
                     self.beobachten.clone(),
+                    self.shared.clone(),
                 ));
             }
             HandshakeResult::Error(e) => return Err(e),
@@ -1530,6 +1544,7 @@ impl RunningClientHandler {
                 local_addr,
                 self.config.clone(),
                 self.beobachten.clone(),
+                self.shared.clone(),
             ));
         }
 
@@ -1568,6 +1583,7 @@ impl RunningClientHandler {
                     local_addr,
                     config.clone(),
                     self.beobachten.clone(),
+                    self.shared.clone(),
                 ));
             }
             HandshakeResult::Error(e) => return Err(e),

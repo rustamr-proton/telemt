@@ -52,7 +52,8 @@ use self::c2me::{
 };
 use self::d2c::{
     MeD2cFlushPolicy, MeWriterResponseOutcome, classify_me_d2c_flush_reason,
-    flush_client_or_cancel, observe_me_d2c_flush_event,
+    flush_client_or_cancel, me_d2c_flush_reason_requires_client_flush,
+    observe_me_d2c_flush_event,
     process_me_writer_response_with_traffic_lease,
 };
 use self::desync::{RelayForensicsState, hash_ip_in, report_desync_frame_too_large_in};

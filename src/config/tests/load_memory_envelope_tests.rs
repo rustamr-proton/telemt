@@ -96,6 +96,44 @@ max_client_frame = 16777217
 }
 
 #[test]
+fn load_rejects_listen_backlog_above_i32_upper_bound() {
+    let path = write_temp_config(
+        r#"
+[server]
+listen_backlog = 2147483648
+"#,
+    );
+
+    let err = ProxyConfig::load(&path).expect_err("listen_backlog above socket cap must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("server.listen_backlog must be within [1, 2147483647]"),
+        "error must explain listen_backlog hard cap, got: {msg}"
+    );
+
+    remove_temp_config(&path);
+}
+
+#[test]
+fn load_rejects_zero_listen_backlog() {
+    let path = write_temp_config(
+        r#"
+[server]
+listen_backlog = 0
+"#,
+    );
+
+    let err = ProxyConfig::load(&path).expect_err("zero listen_backlog must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("server.listen_backlog must be within [1, 2147483647]"),
+        "error must explain listen_backlog lower bound, got: {msg}"
+    );
+
+    remove_temp_config(&path);
+}
+
+#[test]
 fn load_accepts_memory_limits_at_hard_upper_bounds() {
     let path = write_temp_config(
         r#"

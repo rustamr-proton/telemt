@@ -25,7 +25,7 @@ async fn adversarial_parallel_cold_miss_performs_single_interface_refresh() {
         let barrier = std::sync::Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, None).await
+            is_mask_target_local_listener_async("127.0.0.1", 443, local_addr, &[]).await
         }));
     }
 

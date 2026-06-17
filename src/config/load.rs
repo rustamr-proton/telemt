@@ -1940,6 +1940,13 @@ impl ProxyConfig {
             ));
         }
 
+        if config.server.listen_backlog == 0 || config.server.listen_backlog > i32::MAX as u32 {
+            return Err(ProxyError::Config(format!(
+                "server.listen_backlog must be within [1, {}]",
+                i32::MAX
+            )));
+        }
+
         config
             .server
             .client_mss_value()

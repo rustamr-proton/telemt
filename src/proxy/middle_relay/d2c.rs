@@ -55,6 +55,37 @@ pub(super) fn classify_me_d2c_flush_reason(
     MeD2cFlushReason::QueueDrain
 }
 
+pub(super) fn me_d2c_flush_reason_requires_client_flush(reason: MeD2cFlushReason) -> bool {
+    !matches!(reason, MeD2cFlushReason::QueueDrain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_drain_is_not_a_physical_flush_trigger() {
+        assert!(!me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::QueueDrain
+        ));
+        assert!(me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::AckImmediate
+        ));
+        assert!(me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::BatchFrames
+        ));
+        assert!(me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::BatchBytes
+        ));
+        assert!(me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::MaxDelay
+        ));
+        assert!(me_d2c_flush_reason_requires_client_flush(
+            MeD2cFlushReason::Close
+        ));
+    }
+}
+
 pub(super) fn observe_me_d2c_flush_event(
     stats: &Stats,
     reason: MeD2cFlushReason,

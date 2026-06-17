@@ -34,7 +34,7 @@ fn loop_guard_unspecified_bind_uses_interface_inventory() {
         "mask.example",
         443,
         local,
-        Some(resolved),
+        &[resolved],
         &interfaces,
     ));
 }
